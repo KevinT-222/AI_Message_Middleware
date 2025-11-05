@@ -21,10 +21,15 @@ import os, time, json, base64, hashlib, argparse, logging, sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple, List
+from markupsafe import Markup
+from urllib.parse import urlparse
+
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import lru_cache
 
 from flask import (
     Flask, request, jsonify, redirect, url_for, session,
-    render_template_string, make_response
+    render_template_string, make_response, abort, g
 )
 from ding_webhook import DingRobot, DingRobotError
 
@@ -46,6 +51,199 @@ LOG = logging.getLogger("alarm2ding")
 
 APP = Flask(__name__, static_folder="static", static_url_path="/static")
 APP.secret_key = os.getenv("SECRET_KEY", "please_change_me")
+
+def _preview_url_for_img(img_url: str) -> Optional[str]:
+    """把 http(s)://.../snaps/<day>/<file>.jpg 转成 /view/<day>/<file> 的预览页链接"""
+    if not img_url: 
+        return None
+    try:
+        p = urlparse(img_url)
+        parts = [x for x in p.path.split("/") if x]
+        if "snaps" in parts:
+            i = parts.index("snaps")
+            day = parts[i+1]
+            fname = parts[i+2]
+            base = f"{p.scheme}://{p.netloc}" if (p.scheme and p.netloc) else (IMAGE_PUBLIC_BASE or "")
+            return (base.rstrip("/") + f"/view/{day}/{fname}")
+    except Exception:
+        pass
+    return None
+
+# 让模板里也能直接用 preview_from_url(...)
+APP.jinja_env.globals["preview_from_url"] = _preview_url_for_img
+
+# ---------------- Unified UI Theme & Header ----------------
+import re
+
+THEME_CSS = r"""
+:root{
+  --bg:#f6f8fb; --card:#ffffff; --text:#1f2937; --muted:#6b7280; --line:#e5e7eb;
+  --primary:#2563eb; --primary-600:#1d4ed8; --primary-50:#eff6ff;
+  --ok:#16a34a; --ok-50:#e8f7ee; --warn:#d97706; --warn-50:#fff7ed; --err:#dc2626; --err-50:#fde8e8;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0b1220; --card:#0f172a; --text:#e5e7eb; --muted:#94a3b8; --line:#1f2937;
+    --primary:#60a5fa; --primary-600:#3b82f6; --primary-50:#0b1220;
+    --ok:#22c55e; --ok-50:#052e1b; --warn:#f59e0b; --warn-50:#2a1d04; --err:#f87171; --err-50:#2a0b0b;
+  }
+}
+
+/* 基础 */
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--text);
+  font:14px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial;
+  -webkit-text-size-adjust:100%;
+}
+a{color:var(--primary);text-decoration:none} a:hover{text-decoration:underline}
+img{max-width:100%;height:auto;display:block}
+
+/* 容器与卡片 */
+.container{max-width:1180px;margin:3vh auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:0 1px 2px rgba(0,0,0,.04);padding:18px}
+
+/* 顶栏 */
+.topbar{position:sticky;top:0;z-index:50;background:var(--bg);border-bottom:1px solid var(--line)}
+.topbar-inner{max-width:1180px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;padding:12px 16px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700}
+.brand .dot{width:10px;height:10px;border-radius:50%;background:var(--primary)}
+.nav{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.nav a{padding:6px 10px;border-radius:8px}
+.nav a.active{background:var(--primary-50);text-decoration:none}
+
+/* 标题 */
+h1,h2,h3{margin:8px 0 14px}
+
+/* 表单/按钮（默认全响应） */
+.inp, select{padding:8px;border:1px solid var(--line);background:var(--card);color:var(--text);border-radius:8px;min-height:36px}
+.inp:focus, select:focus{outline:2px solid var(--primary-600);outline-offset:1px}
+.btn{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:8px 12px;border:1px solid var(--line);background:var(--card);
+  color:var(--text);border-radius:10px;cursor:pointer;white-space:nowrap
+}
+.btn:hover{border-color:#cfd4dc}
+.btn-primary{background:var(--primary);border-color:var(--primary);color:#fff}
+.btn-primary:hover{background:var(--primary-600);border-color:var(--primary-600)}
+.btn-danger{background:var(--err);border-color:var(--err);color:#fff}
+.btn-ghost{background:transparent}
+
+/* 徽章 */
+.badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px}
+.badge-ok{background:var(--ok-50);color:var(--ok)}
+.badge-err{background:var(--err-50);color:var(--err)}
+.badge-warn{background:var(--warn-50);color:var(--warn)}
+.muted{color:var(--muted)}
+.small{font-size:12px}
+
+/* 🔥 栅格：自动响应（表单容器统一用 .form-grid 或页面里 class="filter"） */
+.form-grid,
+form.filter{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(160px,1fr));
+  gap:8px;
+}
+.form-grid .inp, .form-grid select, form.filter .inp, form.filter select{width:100%}
+
+/* 表格：桌面为常规表格，小屏自动横向滚动；表头吸顶 */
+.table{width:100%;border-collapse:separate;border-spacing:0}
+.table thead th{position:sticky;top:56px;background:var(--card);z-index:1}
+.table th,.table td{border-bottom:1px solid var(--line);padding:10px 12px;text-align:left;vertical-align:top}
+
+/* 小屏优化 */
+@media (max-width: 860px){
+  .topbar-inner{padding:10px 12px}
+  .container{padding:10px}
+  .nav{gap:8px}
+  .btn{padding:8px 10px}
+  /* 表格在小屏滚动显示 */
+  .table{display:block;overflow:auto;-webkit-overflow-scrolling:touch}
+  /* 让工具条换行 */
+  .toolbar, .ops{flex-wrap:wrap}
+}
+/* 小屏把表格渲染为“卡片列表” */
+@media (max-width: 860px){
+  .table.cardify{border:0;display:block;overflow:visible}
+  .table.cardify thead{display:none}
+  .table.cardify tbody{display:block}
+  .table.cardify tr{display:block;background:var(--card);border:1px solid var(--line);border-radius:12px;margin:10px 0;padding:4px}
+  .table.cardify td{display:flex;gap:10px;justify-content:space-between;border:none;padding:8px 10px}
+  .table.cardify td::before{
+    content: attr(data-label);
+    font-weight:600;color:var(--muted);flex:0 0 42%;
+  }
+  .table.cardify td > *{max-width:58%;word-break:break-all;text-align:right}
+}
+
+"""
+
+# 可选：把各页面内联的“基础样式”去掉，避免和主题冲突（用 env 控制）
+STRIP_PAGE_BASE_CSS = os.getenv("STRIP_PAGE_BASE_CSS", "1") == "1"
+_BASE_SELECTORS = (":root", "body{", ".container", ".card", ".btn", ".table")
+
+def _inject_viewport_meta(html: str) -> str:
+    """若页面缺少 <meta name="viewport"> 则自动补上。优先塞到 </head> 前；没有 <head> 就塞到文首。"""
+    if re.search(r'<meta\s+name=["\']viewport["\']', html, flags=re.I):
+        return html
+    tag = '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n'
+    if re.search(r"</head>", html, flags=re.I):
+        return re.sub(r"</head>", tag + "</head>", html, count=1, flags=re.I)
+    # 没有 head：尽量放到 <title> 前；再不行就塞到最前面
+    if re.search(r"<title[^>]*>", html, flags=re.I):
+        return re.sub(r"(<title[^>]*>)", tag + r"\1", html, count=1, flags=re.I)
+    return tag + html
+
+
+def _strip_conflicting_css(html: str) -> str:
+    """删除没有 data-keep 的 <style> 基础样式块，保留组件/局部样式；需要时可关闭此功能。"""
+    if not STRIP_PAGE_BASE_CSS:
+        return html
+
+    def _repl(m):
+        attrs = m.group(1) or ""
+        css   = m.group(2) or ""
+        if "data-keep" in attrs:
+            return m.group(0)
+        # 命中基础选择器的才移除；否则保留
+        if any(sel in css for sel in _BASE_SELECTORS):
+            return ""  # 丢弃冲突的基础样式块
+        return m.group(0)
+
+    return re.sub(r"<style([^>]*)>(.*?)</style>", _repl, html, flags=re.I | re.S)
+
+def _inject_theme_css(html: str) -> str:
+    """无论模板是否有 <head>，都注入主题；优先插到 </head> 前，否则追加到文末（保证覆盖）。"""
+    if 'id="app-theme"' in html:
+        return html
+    block = f'\n<style id="app-theme">{THEME_CSS}</style>\n'
+
+    # 尽量在 </head> 前注入（大小写不敏感）
+    if re.search(r"</head>", html, flags=re.I):
+        return re.sub(r"</head>", block + "</head>", html, count=1, flags=re.I)
+
+    # 没有 <head>：尝试在 </body> 前注入；再不行就直接拼接到文末
+    if re.search(r"</body>", html, flags=re.I):
+        return re.sub(r"</body>", block + "</body>", html, count=1, flags=re.I)
+    return html + block
+
+@APP.after_request
+def _after_inject_theme(resp):
+    try:
+        ct = (resp.headers.get("Content-Type") or "").lower()
+        if "text/html" in ct and not resp.direct_passthrough:
+            body = resp.get_data(as_text=True)
+            body = _inject_viewport_meta(body)
+            # ↓↓↓ 加这一行：预览页不要剥样式
+            if not (request and request.path.startswith("/view/")):
+                body = _strip_conflicting_css(body)
+            body = _inject_theme_css(body)
+            resp.set_data(body)
+    except Exception as e:
+        LOG.debug("theme inject fail: %s", e)
+    return resp
+
 
 APP_NAME     = os.getenv("APP_NAME", "algo-edge")
 DEDUP_WINDOW = float(os.getenv("DEDUP_WINDOW", "10"))
@@ -109,6 +307,19 @@ ALGO_MAP = {
 }
 
 # ---------------- Utils ----------------
+
+# _recent_keys 做定期清理
+def _prune_recent_keys(now: float, ttl: float):
+    # 最多每 200 次调用清一次；或当字典过大时清
+    if not hasattr(_prune_recent_keys, "_cnt"):
+        _prune_recent_keys._cnt = 0
+    _prune_recent_keys._cnt += 1
+    if _prune_recent_keys._cnt % 200 != 0 and len(_recent_keys) < 10000:
+        return
+    dead = [k for k, t in list(_recent_keys.items()) if now - t > max(ttl*2, 30)]
+    for k in dead:
+        _recent_keys.pop(k, None)
+
 def _safe_str(d: Dict[str, Any], key: str, default: str = "") -> str:
     v = d.get(key, default)
     return str(v) if v is not None else default
@@ -255,7 +466,6 @@ CREATE TABLE IF NOT EXISTS channels (
   first_seen   TEXT,
   last_seen    TEXT,
   cnt          INTEGER NOT NULL DEFAULT 0,
-  -- 以下三项是旧版字段（单一时间窗 + 掩码），会自动迁移到 channel_rules
   rule_mask    INTEGER NOT NULL DEFAULT 0,
   rule_start   TEXT,
   rule_end     TEXT,
@@ -284,7 +494,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
 CREATE INDEX IF NOT EXISTS idx_messages_device ON messages(device_id);
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(device_id, channel_key);
 
--- 新增：多时间段规则（按“通道 + 星期”存多段）
+-- 多时间段规则（通道 × 星期 × 多段）
 CREATE TABLE IF NOT EXISTS channel_rules (
   device_id   TEXT NOT NULL,
   channel_key TEXT NOT NULL,
@@ -294,8 +504,45 @@ CREATE TABLE IF NOT EXISTS channel_rules (
   end_hhmm    TEXT NOT NULL,         -- 'HH:MM'
   PRIMARY KEY (device_id, channel_key, weekday, seg_idx)
 );
-
 CREATE INDEX IF NOT EXISTS idx_rules_key_day ON channel_rules(device_id, channel_key, weekday);
+
+-- 用户与权限
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  is_admin INTEGER NOT NULL DEFAULT 0,
+  active   INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS user_channels (
+  user_id INTEGER NOT NULL,
+  device_id TEXT NOT NULL,
+  channel_key TEXT NOT NULL,
+  PRIMARY KEY (user_id, device_id, channel_key)
+);
+
+-- 多 Webhook 与路由
+CREATE TABLE IF NOT EXISTS webhooks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  access_token TEXT NOT NULL,
+  secret TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  is_default INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT
+);
+
+-- 通道 → 多个 webhook 绑定
+CREATE TABLE IF NOT EXISTS channel_webhooks (
+  device_id TEXT NOT NULL,
+  channel_key TEXT NOT NULL,
+  webhook_id INTEGER NOT NULL,
+  PRIMARY KEY (device_id, channel_key, webhook_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_dedup ON messages(dedup_key);
 """
 
 
@@ -314,14 +561,49 @@ def init_db():
 def ensure_migrations():
     conn = _db()
     try:
-        # 为老库补列（若已存在会抛异常，直接忽略）
+        # 补列：messages.forward_reason
         try:
             conn.execute("ALTER TABLE messages ADD COLUMN forward_reason TEXT")
         except Exception:
             pass
+        # 创建新增表（若已存在不会报错）
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          username TEXT UNIQUE NOT NULL,
+          password_hash TEXT NOT NULL,
+          is_admin INTEGER NOT NULL DEFAULT 0,
+          active   INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS user_channels (
+          user_id INTEGER NOT NULL,
+          device_id TEXT NOT NULL,
+          channel_key TEXT NOT NULL,
+          PRIMARY KEY (user_id, device_id, channel_key)
+        );
+        CREATE TABLE IF NOT EXISTS webhooks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          access_token TEXT NOT NULL,
+          secret TEXT,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          is_default INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS channel_webhooks (
+          device_id TEXT NOT NULL,
+          channel_key TEXT NOT NULL,
+          webhook_id INTEGER NOT NULL,
+          PRIMARY KEY (device_id, channel_key, webhook_id)
+        );
+        """)
         conn.commit()
     finally:
         conn.close()
+
+    # 引导：若无任何用户，则创建默认管理员
+    _bootstrap_admin_if_absent()
 
 def upsert_device(device_id: str, seen_ts: str) -> int:
     conn = _db()
@@ -405,7 +687,7 @@ def list_channels(device_filter: str = "") -> List[sqlite3.Row]:
 def insert_message(rec: Dict[str, Any]):
     conn = _db()
     try:
-        conn.execute("""INSERT INTO messages
+        conn.execute("""INSERT OR IGNORE INTO messages
         (ts, device_id, channel_key, channel_name, type, type_name, box_name, device_name,
          score, image_url, forwarded, forward_reason, dedup_key, raw_json)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -424,6 +706,17 @@ def query_messages(filters: Dict[str, Any], limit: int, offset: int) -> Tuple[Li
     if filters.get("forwarded") in ("0","1"): wh.append("forwarded = ?"); args.append(int(filters["forwarded"]))
     if filters.get("from"):      wh.append("ts >= ?"); args.append(filters["from"])
     if filters.get("to"):        wh.append("ts <= ?"); args.append(filters["to"])
+
+    # 权限限制（普通用户）
+    if filters.get("visible_uid") is not None:
+        wh.append("""EXISTS (
+            SELECT 1 FROM user_channels uc
+            WHERE uc.user_id=?
+              AND uc.device_id = messages.device_id
+              AND uc.channel_key = messages.channel_key
+        )""")
+        args.append(int(filters["visible_uid"]))
+
     where = ("WHERE " + " AND ".join(wh)) if wh else ""
     conn = _db()
     try:
@@ -454,8 +747,17 @@ def delete_messages_by_filters(filters: Dict[str, Any]) -> int:
     if filters.get("channel_key"): wh.append("channel_key = ?"); args.append(filters["channel_key"])
     if filters.get("type") is not None and filters["type"] != "": wh.append("type = ?"); args.append(int(filters["type"]))
     if filters.get("forwarded") in ("0","1"): wh.append("forwarded = ?"); args.append(int(filters["forwarded"]))
-    if filters.get("from"):      wh.append("ts >= ?"); args.append(filters["from"])
-    if filters.get("to"):        wh.append("ts <= ?"); args.append(filters["to"])
+    if filters.get("from"): wh.append("ts >= ?"); args.append(filters["from"])
+    if filters.get("to"):   wh.append("ts <= ?"); args.append(filters["to"])
+    # ☆ 新增：可见性限制（普通用户）
+    if filters.get("visible_uid") is not None:
+        wh.append("""EXISTS (
+            SELECT 1 FROM user_channels uc
+            WHERE uc.user_id=?
+              AND uc.device_id = messages.device_id
+              AND uc.channel_key = messages.channel_key
+        )""")
+        args.append(int(filters["visible_uid"]))
     where = ("WHERE " + " AND ".join(wh)) if wh else ""
     conn = _db()
     try:
@@ -558,6 +860,161 @@ def migrate_legacy_channel_rules_once():
         conn.commit()
     finally:
         conn.close()
+        
+def _now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _bootstrap_admin_if_absent():
+    conn = _db()
+    try:
+        r = conn.execute("SELECT COUNT(1) AS c FROM users").fetchone()
+        if (r and int(r["c"]) == 0):
+            u = os.getenv("ADMIN_USER", "admin")
+            p = os.getenv("ADMIN_PASS", "admin")
+            conn.execute("INSERT INTO users(username, password_hash, is_admin, active, created_at) VALUES(?,?,?,?,?)",
+                         (u, generate_password_hash(p), 1, 1, _now_str()))
+            conn.commit()
+            LOG.warning("bootstrap: created admin user '%s' (please change password)", u)
+    finally:
+        conn.close()
+
+def user_by_username(username: str):
+    conn = _db()
+    try:
+        return conn.execute("SELECT * FROM users WHERE username=? AND active=1", (username,)).fetchone()
+    finally:
+        conn.close()
+
+def user_by_id(uid: int):
+    conn = _db()
+    try:
+        return conn.execute("SELECT * FROM users WHERE id=? AND active=1", (uid,)).fetchone()
+    finally:
+        conn.close()
+
+def user_list():
+    conn = _db()
+    try:
+        return conn.execute("SELECT id,username,is_admin,active,created_at FROM users ORDER BY id ASC").fetchall()
+    finally:
+        conn.close()
+
+def user_add(username: str, password: str, is_admin: int):
+    conn = _db()
+    try:
+        conn.execute("INSERT INTO users(username,password_hash,is_admin,active,created_at) VALUES(?,?,?,?,?)",
+                     (username, generate_password_hash(password), int(is_admin), 1, _now_str()))
+        conn.commit()
+    finally:
+        conn.close()
+
+def user_delete(uid: int):
+    conn = _db()
+    try:
+        conn.execute("DELETE FROM users WHERE id=?", (uid,))
+        conn.execute("DELETE FROM user_channels WHERE user_id=?", (uid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+def user_visible_pairs(uid: int) -> set[tuple[str,str]]:
+    """返回 (device_id, channel_key) 集合。管理员返回空集代表不限制。"""
+    u = user_by_id(uid)
+    if not u: return set()
+    if int(u["is_admin"]) == 1: return set()
+    conn = _db()
+    try:
+        rows = conn.execute("SELECT device_id, channel_key FROM user_channels WHERE user_id=?", (uid,)).fetchall()
+        return {(r["device_id"], r["channel_key"]) for r in rows}
+    finally:
+        conn.close()
+
+def replace_user_visible_pairs(uid: int, pairs: list[tuple[str,str]]):
+    conn = _db()
+    try:
+        conn.execute("DELETE FROM user_channels WHERE user_id=?", (uid,))
+        for dev, ck in pairs:
+            conn.execute("INSERT OR IGNORE INTO user_channels(user_id,device_id,channel_key) VALUES(?,?,?)", (uid, dev, ck))
+        conn.commit()
+    finally:
+        conn.close()
+
+def webhooks_list(active_only=True):
+    conn = _db()
+    try:
+        if active_only:
+            return conn.execute("SELECT * FROM webhooks WHERE enabled=1 ORDER BY id ASC").fetchall()
+        return conn.execute("SELECT * FROM webhooks ORDER BY id ASC").fetchall()
+    finally:
+        conn.close()
+
+def webhook_add(name: str, token: str, secret: str, enabled: int, is_default: int):
+    conn = _db()
+    try:
+        conn.execute(
+            "INSERT INTO webhooks(name,access_token,secret,enabled,is_default,created_at) VALUES(?,?,?,?,?,?)",
+            (name, token, secret, int(enabled), int(is_default), _now_str())
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def webhook_update_enable(wid: int, enabled: int, is_default: Optional[int]=None):
+    conn = _db()
+    try:
+        if is_default is None:
+            conn.execute("UPDATE webhooks SET enabled=? WHERE id=?", (int(enabled), wid))
+        else:
+            conn.execute(
+                "UPDATE webhooks SET enabled=?, is_default=? WHERE id=?",
+                (int(enabled), int(is_default), wid)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+def webhook_delete(wid: int):
+    conn = _db()
+    try:
+        conn.execute("DELETE FROM webhooks WHERE id=?", (wid,))
+        conn.execute("DELETE FROM channel_webhooks WHERE webhook_id=?", (wid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+def channel_webhook_ids(device_id: str, channel_key: str) -> list[int]:
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT webhook_id FROM channel_webhooks WHERE device_id=? AND channel_key=?",
+            (device_id, channel_key)
+        ).fetchall()
+        return [int(r["webhook_id"]) for r in rows]
+    finally:
+        conn.close()
+
+def replace_channel_webhooks(device_id: str, channel_key: str, webhook_ids: list[int]):
+    conn = _db()
+    try:
+        conn.execute("DELETE FROM channel_webhooks WHERE device_id=? AND channel_key=?", (device_id, channel_key))
+        for wid in webhook_ids:
+            conn.execute("INSERT OR IGNORE INTO channel_webhooks(device_id,channel_key,webhook_id) VALUES(?,?,?)",
+                         (device_id, channel_key, int(wid)))
+        conn.commit()
+    finally:
+        conn.close()
+
+@lru_cache(maxsize=128)
+def _robot_cached(wid: int):
+    conn = _db()
+    try:
+        r = conn.execute("SELECT access_token, secret, enabled FROM webhooks WHERE id=?", (wid,)).fetchone()
+        if not r or int(r["enabled"]) != 1:
+            return None
+        return DingRobot(access_token=r["access_token"], secret=(r["secret"] or ""), timeout=8.0)
+    finally:
+        conn.close()
+
 
 
 # ---------------- Markdown 构造 ----------------
@@ -587,7 +1044,11 @@ def _build_md(payload: Dict[str, Any], img_url: Optional[str]) -> Tuple[str, str
 
     lines = []
     if img_url:
+        pv = _preview_url_for_img(img_url)
+        # 行内小图（钉钉里会自适应），下面追加两个链接
         lines.append(f"![snap]({img_url})\n")
+        if pv:
+            lines.append(f"[手机预览（适配微信）]({pv})  ·  [原图]({img_url})\n")
 
     lines += [
         f"- **时间**：`{st}`",
@@ -619,6 +1080,7 @@ def _build_md(payload: Dict[str, Any], img_url: Optional[str]) -> Tuple[str, str
 
 # ---------------- Core Handle ----------------
 def _handle_record_and_forward(payload: Dict[str, Any], echo: bool=False) -> Dict[str, Any]:
+
     # 去重
     dkey = _dedup_key(payload)
     now  = time.time()
@@ -626,6 +1088,9 @@ def _handle_record_and_forward(payload: Dict[str, Any], echo: bool=False) -> Dic
     if last and (now - last) < DEDUP_WINDOW:
         return {"code": 200, "message": "重复告警抑制"}
     _recent_keys[dkey] = now
+    
+    # 定期清理
+    _prune_recent_keys(now, DEDUP_WINDOW)
 
     st         = _parse_time(_safe_str(payload, "signTime"))
     device_id  = _safe_str(payload, "deviceId") or "-"
@@ -669,18 +1134,38 @@ def _handle_record_and_forward(payload: Dict[str, Any], echo: bool=False) -> Dic
     forwarded = False
     forward_reason = ""
     title, text_md = _build_md(payload, img_url)
+
     if not echo and forward_ok:
-        try:
-            ROBOT.send_markdown(title=title, text_md=text_md,
-                                at_user_ids=AT_USER_IDS or None,
-                                at_mobiles=AT_MOBILES or None)
-            forwarded = True
-            forward_reason = "已转发"
-            LOG.info("ding: sent title=%s dev=%s ch=%s", title, dev_id, ch_key)
-        except DingRobotError as e:
+        # 计算推送目标：优先通道绑定，其次默认 webhook
+        target_ids = channel_webhook_ids(dev_id, ch_key)
+        if not target_ids:
+            target_ids = [r["id"] for r in webhooks_list(active_only=True) if int(r["is_default"]) == 1]
+
+
+        succ = 0; total = 0; errs = []
+        for wid in (target_ids or []):
+            total += 1
+            bot = _robot_cached(wid)
+            if not bot:
+                errs.append(f"wid={wid}禁用/不存在")
+                continue
+            try:
+                bot.send_markdown(title=title, text_md=text_md,
+                                  at_user_ids=AT_USER_IDS or None,
+                                  at_mobiles=AT_MOBILES or None)
+                succ += 1
+            except DingRobotError as e:
+                errs.append(f"wid={wid}:{e}")
+
+        if total == 0:
             forwarded = False
-            forward_reason = f"未转发（接收端异常：{e}）"
-            LOG.error("ding: send fail: %s", e)
+            forward_reason = "未转发（无可用webhook）"
+        else:
+            forwarded = (succ > 0)
+            if forwarded:
+                forward_reason = f"已转发({succ}/{total})"
+            else:
+                forward_reason = "未转发（全部失败：" + "；".join(errs[:2]) + "）"
     else:
         if echo:
             forward_reason = "未转发（echo调试）"
@@ -690,8 +1175,6 @@ def _handle_record_and_forward(payload: Dict[str, Any], echo: bool=False) -> Dic
             if ch_enabled  != 1: reasons.append("通道禁用")
             if not time_ok:      reasons.append("非时间段")
             forward_reason = "未转发（" + ("，".join(reasons) or "未知原因") + "）"
-        LOG.info("ding: skip forward (dev_enabled=%s, ch_enabled=%s, time_ok=%s, dev=%s, ch=%s)",
-                 dev_enabled, ch_enabled, time_ok, dev_id, ch_key)
 
     # 写入历史
     rec = {
@@ -749,38 +1232,455 @@ def login_required(f):
         return f(*a, **kw)
     return wrapper
 
+def admin_required(f):
+    from functools import wraps
+    @wraps(f)
+    def wrapper(*a, **kw):
+        if not session.get("authed"):
+            return redirect(url_for("login", next=request.path))
+        if not session.get("is_admin"):
+            return redirect(url_for("history"))
+        return f(*a, **kw)
+    return wrapper
+
 @APP.route("/login", methods=["GET","POST"])
 def login():
     err = ""
     if request.method == "POST":
-        u = request.form.get("username", "")
+        u = request.form.get("username", "").strip()
         p = request.form.get("password", "")
-        if u == ADMIN_USER and p == ADMIN_PASS:
+        row = user_by_username(u)
+        if row and check_password_hash(row["password_hash"], p) and int(row["active"]) == 1:
             session["authed"] = True
             session["user"] = u
+            session["uid"] = int(row["id"])
+            session["is_admin"] = (int(row["is_admin"]) == 1)
             nxt = request.args.get("next") or url_for("history")
             return redirect(nxt)
         err = "用户名或密码不正确"
+
     return render_template_string("""
 <!doctype html>
 <title>登录 - Alarm2Ding</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<div style="max-width:420px;margin:8vh auto;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial">
-  <h2>Alarm2Ding 登录</h2>
-  {% if err %}<div style="color:#d33">{{ err }}</div>{% endif %}
-  <form method="post">
-    <label>用户名</label><br><input name="username" class="inp" autofocus><br><br>
-    <label>密码</label><br><input name="password" type="password" class="inp"><br><br>
-    <button type="submit">登录</button>
-  </form>
-  <style>.inp{width:100%;padding:8px;border:1px solid #ccc;border-radius:6px}</style>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <div class="brand"><span class="dot"></span><span>Alarm2Ding</span></div>
+    <div class="nav">
+      <a href="#" class="active">登录</a>
+    </div>
+  </div>
+</div>
+
+<div class="container" style="max-width:460px">
+  <div class="card">
+    <h2 style="margin:0 0 12px">账户登录</h2>
+    {% if err %}
+      <div class="badge badge-err" style="display:block;margin-bottom:10px">{{ err }}</div>
+    {% endif %}
+    <form method="post" class="form-grid">
+      <input name="username" class="inp" placeholder="用户名" autofocus required>
+      <input name="password" type="password" class="inp" placeholder="密码" required>
+      <button type="submit" class="btn btn-primary" style="width:max-content">登录</button>
+    </form>
+  </div>
 </div>
 """, err=err)
+
 
 @APP.get("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+# ---------- User pages ----------
+@APP.get("/users")
+@admin_required
+def users_page():
+    rows = user_list()
+    return render_template_string("""
+<!doctype html>
+<title>用户管理 - Alarm2Ding</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<div class="container">
+  <div class="topbar-inner">
+    <div class="brand"><span class="dot"></span><span>用户管理</span></div>
+    <div class="nav">
+      <a href="{{ url_for('webhooks_page') }}">Webhook</a>
+      <a href="{{ url_for('devices') }}">通道管理</a>
+      <a href="{{ url_for('history') }}">历史记录</a>
+      <a href="{{ url_for('logout') }}">退出</a>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3 style="margin:0 0 10px">新增用户</h3>
+    <form method="post" action="{{ url_for('users_add') }}" class="form-grid">
+      <input name="username" placeholder="用户名" class="inp" required>
+      <input name="password" placeholder="初始密码" class="inp" required>
+      <label class="inp" style="display:flex;align-items:center;gap:8px;border:none">
+        <input type="checkbox" name="is_admin" value="1"> 管理员
+      </label>
+      <div></div><div></div>
+      <button class="btn btn-primary" style="width:max-content">添加</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <table class="table cardify">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>用户名</th>
+          <th>角色</th>
+          <th>状态</th>
+          <th>创建时间</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in rows %}
+        <tr>
+          <td data-label="ID">{{ r['id'] }}</td>
+          <td data-label="用户名">{{ r['username'] }}</td>
+          <td data-label="角色">
+            {% if r['is_admin'] %}
+              <span class="badge badge-ok">管理员</span>
+            {% else %}
+              <span class="badge">普通用户</span>
+            {% endif %}
+          </td>
+          <td data-label="状态">
+            {% if r['active'] %}
+              <span class="badge badge-ok">启用</span>
+            {% else %}
+              <span class="badge badge-err">停用</span>
+            {% endif %}
+          </td>
+          <td data-label="创建时间">{{ r['created_at'] or '' }}</td>
+          <td data-label="操作">
+            <div class="ops">
+              <a class="btn" href="{{ url_for('users_perm', uid=r['id']) }}">配置可见通道</a>
+              {% if not r['is_admin'] %}
+              <form method="post" action="{{ url_for('users_del') }}" onsubmit="return confirm('删除该用户？不可恢复');" style="display:inline">
+                <input type="hidden" name="uid" value="{{ r['id'] }}">
+                <button class="btn btn-danger">删除</button>
+              </form>
+              {% else %}
+                <span class="muted">管理员不可删除</span>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<style>
+/* 仅页面局部样式，避免触发基础样式剥离 */
+.ops{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+</style>
+""", rows=rows)
+
+@APP.post("/users/add")
+@admin_required
+def users_add():
+    username = (request.form.get("username") or "").strip()
+    password = (request.form.get("password") or "")
+    is_admin = 1 if request.form.get("is_admin")=="1" else 0
+    if username and password:
+        user_add(username, password, is_admin)
+    return redirect(url_for("users_page"))
+
+@APP.post("/users/del")
+@admin_required
+def users_del():
+    try:
+        uid = int(request.form.get("uid") or "0")
+        user_delete(uid)
+    except Exception:
+        pass
+    return redirect(url_for("users_page"))
+
+@APP.route("/users/perm", methods=["GET","POST"])
+@admin_required
+def users_perm():
+    uid = int(request.args.get("uid") or request.form.get("uid") or "0")
+    u = user_by_id(uid)
+    if not u:
+        return redirect(url_for("users_page"))
+
+    if request.method == "POST":
+        pairs = []
+        for k, v in request.form.items():
+            if k.startswith("ck_") and v == "1":
+                # 名称格式：ck___<device_id>___<channel_key>
+                _, dev, ck = k.split("___", 2)
+                pairs.append((dev, ck))
+        replace_user_visible_pairs(uid, pairs)
+        return redirect(url_for("users_page"))
+
+    rows = list_channels("")  # 全量通道
+    vis = user_visible_pairs(uid)
+
+    return render_template_string("""
+<!doctype html>
+<title>配置可见通道 - Alarm2Ding</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<div class="container">
+  <div class="topbar-inner">
+    <div class="brand"><span class="dot"></span><span>配置可见通道</span></div>
+    <div class="nav">
+      <a class="active" href="{{ url_for('users_page') }}">用户管理</a>
+      <a href="{{ url_for('webhooks_page') }}">Webhook</a>
+      <a href="{{ url_for('devices') }}">通道管理</a>
+      <a href="{{ url_for('history') }}">历史记录</a>
+      <a href="{{ url_for('logout') }}">退出</a>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3 style="margin:0 0 8px">用户：{{ u['username'] }}</h3>
+    <div class="muted">勾选后该用户即可在“历史记录”中看到选中的通道告警。</div>
+  </div>
+
+  <form method="post">
+    <input type="hidden" name="uid" value="{{ u['id'] }}">
+
+    <div class="card" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+      <input id="kw" class="inp" placeholder="关键字过滤（device_id / 位置键 / 位置名 / box / index/gbid）" style="min-width:260px">
+      <button type="button" class="btn" onclick="selectAll(true)">全选可见</button>
+      <button type="button" class="btn" onclick="selectAll(false)">全不选</button>
+      <button type="button" class="btn" onclick="invertSel()">反选</button>
+      <span class="muted small" id="stat"></span>
+    </div>
+
+    <div class="card">
+      <table class="table cardify" id="tab">
+        <thead>
+          <tr>
+            <th style="width:28px"><input type="checkbox" id="chk_all" onclick="toggleAll()"></th>
+            <th>设备ID</th>
+            <th>位置键</th>
+            <th>位置名</th>
+            <th>box</th>
+            <th>index/gbid</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for r in rows %}
+          {% set checked = ((r['device_id'], r['channel_key']) in vis) %}
+          <tr>
+            <td data-label="选">
+              <input type="checkbox"
+                     name="ck___{{ r['device_id'] }}___{{ r['channel_key'] }}"
+                     value="1" {% if checked %}checked{% endif %}>
+            </td>
+            <td data-label="设备ID"><code>{{ r['device_id'] }}</code></td>
+            <td data-label="位置键"><code>{{ r['channel_key'] }}</code></td>
+            <td data-label="位置名">{{ r['channel_name'] or '' }}</td>
+            <td data-label="box">{{ r['box_name'] or '' }}</td>
+            <td data-label="index/gbid">{{ r['index_or_gbid'] or '' }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div style="display:flex;gap:10px;margin-top:12px">
+      <button class="btn btn-primary" type="submit">保存</button>
+      <a class="btn" href="{{ url_for('users_page') }}">返回</a>
+    </div>
+  </form>
+</div>
+
+<script>
+const $ = (s, p=document) => p.querySelector(s);
+const $$ = (s, p=document) => Array.from(p.querySelectorAll(s));
+
+function toggleAll(){
+  const c = $('#chk_all').checked;
+  $$('#tab tbody input[type="checkbox"]').forEach(x => { if (!x.closest('tr').hidden) x.checked = c; });
+  updateStat();
+}
+function selectAll(v){
+  $$('#tab tbody tr').forEach(tr => {
+    if (!tr.hidden){
+      const cb = tr.querySelector('input[type="checkbox"]');
+      if (cb) cb.checked = v;
+    }
+  });
+  updateStat();
+}
+function invertSel(){
+  $$('#tab tbody tr').forEach(tr => {
+    if (!tr.hidden){
+      const cb = tr.querySelector('input[type="checkbox"]');
+      if (cb) cb.checked = !cb.checked;
+    }
+  });
+  updateStat();
+}
+function updateStat(){
+  const all = $$('#tab tbody input[type="checkbox"]').filter(cb => !cb.closest('tr').hidden);
+  const on  = all.filter(cb => cb.checked);
+  $('#stat').textContent = `当前可见：${all.length} 行，已选：${on.length}`;
+}
+$('#kw').addEventListener('input', e => {
+  const kw = e.target.value.trim().toLowerCase();
+  $$('#tab tbody tr').forEach(tr => {
+    const txt = tr.innerText.toLowerCase();
+    tr.hidden = kw ? !txt.includes(kw) : false;
+  });
+  updateStat();
+});
+updateStat();
+</script>
+""", u=u, rows=rows, vis=vis)
+
+# ---------- webhooks settings pages ----------
+@APP.route("/webhooks", methods=["GET","POST"])
+@admin_required
+def webhooks_page():
+    if request.method == "POST":
+        name = (request.form.get("name") or "").strip()
+        token= (request.form.get("token") or "").strip()
+        secret=(request.form.get("secret") or "").strip()
+        enabled = 1 if request.form.get("enabled")=="1" else 0
+        is_def  = 1 if request.form.get("is_default")=="1" else 0
+        if name and token:
+            webhook_add(name, token, secret, enabled, is_def)
+        return redirect(url_for("webhooks_page"))
+
+    rows = webhooks_list(active_only=False)
+    return render_template_string("""
+<!doctype html>
+<title>Webhook 管理 - Alarm2Ding</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+<div class="container">
+  <div class="topbar-inner">
+    <div class="brand"><span class="dot"></span><span>Webhook 管理</span></div>
+    <div class="nav">
+      <a href="{{ url_for('users_page') }}">用户管理</a>
+      <a href="{{ url_for('devices') }}">通道管理</a>
+      <a href="{{ url_for('history') }}">历史记录</a>
+      <a href="{{ url_for('logout') }}">退出</a>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3 style="margin:0 0 10px">新增 Webhook</h3>
+    <form method="post" class="form-grid">
+      <input name="name" placeholder="名称" class="inp" required>
+      <input name="token" placeholder="access_token" class="inp" required>
+      <input name="secret" placeholder="secret（可空）" class="inp">
+      <label class="inp" style="display:flex;align-items:center;gap:8px;border:none">
+        <input type="checkbox" name="enabled" value="1" checked> 启用
+      </label>
+      <label class="inp" style="display:flex;align-items:center;gap:8px;border:none">
+        <input type="checkbox" name="is_default" value="1"> 默认
+      </label>
+      <button class="btn btn-primary" style="width:max-content">添加</button>
+    </form>
+    <div class="muted" style="margin-top:6px">提示：若通道未绑定任何 webhook，则回退使用“默认 webhook”。</div>
+  </div>
+
+  <div class="card">
+    <table class="table cardify">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>名称</th>
+          <th>状态</th>
+          <th>默认</th>
+          <th>创建时间</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in rows %}
+        {% set enabled = (r['enabled']==1) %}
+        {% set isdef = (r['is_default']==1) %}
+        <tr>
+          <td data-label="ID">{{ r['id'] }}</td>
+          <td data-label="名称">{{ r['name'] }}</td>
+          <td data-label="状态">
+            {% if enabled %}
+              <span class="badge badge-ok">启用</span>
+            {% else %}
+              <span class="badge badge-err">禁用</span>
+            {% endif %}
+          </td>
+          <td data-label="默认">
+            {% if isdef %}
+              <span class="badge badge-warn">默认</span>
+            {% endif %}
+          </td>
+          <td data-label="创建时间">{{ r['created_at'] or '' }}</td>
+          <td data-label="操作">
+            <div class="ops">
+              <form method="post" action="{{ url_for('webhooks_toggle') }}" style="display:inline">
+                <input type="hidden" name="wid" value="{{ r['id'] }}">
+                <input type="hidden" name="enabled" value="{{ 0 if enabled else 1 }}">
+                <button class="btn">{{ '禁用' if enabled else '启用' }}</button>
+              </form>
+              <form method="post" action="{{ url_for('webhooks_toggle_default') }}" style="display:inline">
+                <input type="hidden" name="wid" value="{{ r['id'] }}">
+                <input type="hidden" name="is_default" value="{{ 0 if isdef else 1 }}">
+                <button class="btn">{{ '取消默认' if isdef else '设为默认' }}</button>
+              </form>
+              <form method="post" action="{{ url_for('webhooks_del') }}" style="display:inline" onsubmit="return confirm('删除该 webhook？不可恢复');">
+                <input type="hidden" name="wid" value="{{ r['id'] }}">
+                <button class="btn btn-danger">删除</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<style>
+/* 仅页面局部样式，避免触发基础样式剥离 */
+.ops{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+</style>
+""", rows=rows)
+
+
+@APP.post("/webhooks/toggle")
+@admin_required
+def webhooks_toggle():
+    wid = int(request.form.get("wid"))
+    enabled = int(request.form.get("enabled"))
+    webhook_update_enable(wid, enabled)
+    _robot_cached.cache_clear()
+    return redirect(url_for("webhooks_page"))
+
+@APP.post("/webhooks/toggle_default")
+@admin_required
+def webhooks_toggle_default():
+    wid = int(request.form.get("wid"))
+    is_def = int(request.form.get("is_default"))  # 0/1
+    # 设为默认时顺便确保启用，避免默认但禁用导致“默认不可用”
+    webhook_update_enable(wid, enabled=1, is_default=is_def)
+    _robot_cached.cache_clear()
+    return redirect(url_for("webhooks_page"))
+
+@APP.post("/webhooks/del")
+@admin_required
+def webhooks_del():
+    wid = int(request.form.get("wid"))
+    webhook_delete(wid)
+    _robot_cached.cache_clear()
+    return redirect(url_for("webhooks_page"))
 
 # ---------- Device & Channel pages ----------
 @APP.route("/devices", methods=["GET","POST"])
@@ -788,6 +1688,8 @@ def logout():
 def devices():
     # 切换通道开关
     if request.method == "POST":
+        if not session.get("is_admin"):
+            abort(403)
         device_id   = request.form.get("device_id", "")
         channel_key = request.form.get("channel_key", "")
         enabled     = 1 if request.form.get("enabled") == "1" else 0
@@ -799,6 +1701,12 @@ def devices():
 
     device_filter = (request.args.get("device_id") or "").strip()
     rows = list_channels(device_filter=device_filter)
+    
+    # 权限过滤：普通用户仅看自己授权的通道
+    vset = set()
+    if not session.get("is_admin"):
+        vset = user_visible_pairs(int(session.get("uid")))
+        rows = [r for r in rows if (r["device_id"], r["channel_key"]) in vset]
 
     # 计算规则摘要
     rows2 = []
@@ -858,7 +1766,10 @@ a:hover{text-decoration:underline}
   <div class="topbar">
     <h2>通道管理</h2>
     <div>
-      <a href="{{ url_for('history') }}">历史记录</a> ｜ <a href="{{ url_for('logout') }}">退出</a>
+        {% if session.get('is_admin') %}
+        <a href="{{ url_for('users_page') }}">用户管理</a> ｜ <a href="{{ url_for('webhooks_page') }}">Webhook</a> ｜ 
+        {% endif %}
+        <a href="{{ url_for('history') }}">历史记录</a> ｜ <a href="{{ url_for('logout') }}">退出</a>
     </div>
   </div>
 
@@ -870,7 +1781,7 @@ a:hover{text-decoration:underline}
   </div>
 
   <div class="card">
-    <table class="table">
+    <table class="table cardify">
       <thead><tr>
         <th>设备ID</th><th>位置键</th><th>位置名</th><th>box</th><th>index/gbid</th>
         <th>状态</th><th>规则摘要</th><th>操作</th>
@@ -878,26 +1789,26 @@ a:hover{text-decoration:underline}
       <tbody>
         {% for r in rows %}
         <tr>
-          <td><code>{{ r['device_id'] }}</code></td>
-          <td><code>{{ r['channel_key'] }}</code></td>
-          <td>{{ r['channel_name'] or '' }}</td>
-          <td>{{ r['box_name'] or '' }}</td>
-          <td>{{ r['index_or_gbid'] or '' }}</td>
-          <td>
+          <td data-label="设备ID"><code>{{ r['device_id'] }}</code></td>
+          <td data-label="位置键"><code>{{ r['channel_key'] }}</code></td>
+          <td data-label="位置名">{{ r['channel_name'] or '' }}</td>
+          <td data-label="box">{{ r['box_name'] or '' }}</td>
+          <td data-label="index/gbid">{{ r['index_or_gbid'] or '' }}</td>
+          <td data-label="状态">
             {% if r['enabled'] %}
               <span class="badge badge-ok">转发</span>
             {% else %}
               <span class="badge badge-err">不转发</span>
             {% endif %}
           </td>
-          <td style="font-size:12px;line-height:1.3">{{ r['rule_label'] }}</td>
-          <td>
+          <td data-label="规则摘要" style="font-size:12px;line-height:1.3">{{ r['rule_label'] }}</td>
+          <td data-label="操作">
             <div class="ops">
               <form method="post">
-              <input type="hidden" name="device_id" value="{{ r['device_id'] }}">
-              <input type="hidden" name="channel_key" value="{{ r['channel_key'] }}">
-              <input type="hidden" name="enabled" value="{{ 0 if r['enabled'] else 1 }}">
-              <button type="submit" class="btn">{{ '禁用转发' if r['enabled'] else '启用转发' }}</button>
+                <input type="hidden" name="device_id" value="{{ r['device_id'] }}">
+                <input type="hidden" name="channel_key" value="{{ r['channel_key'] }}">
+                <input type="hidden" name="enabled" value="{{ 0 if r['enabled'] else 1 }}">
+                <button type="submit" class="btn">{{ '禁用转发' if r['enabled'] else '启用转发' }}</button>
               </form>
               <a class="btn" href="{{ url_for('edit_channel_rule') }}?device_id={{ r['device_id'] }}&channel_key={{ r['channel_key'] }}">编辑规则</a>
             </div>
@@ -911,7 +1822,7 @@ a:hover{text-decoration:underline}
 """, rows=rows2)
 
 @APP.route("/devices/edit", methods=["GET","POST"])
-@login_required
+@admin_required
 def edit_channel_rule():
     device_id   = (request.args.get("device_id") or request.form.get("device_id") or "").strip()
     channel_key = (request.args.get("channel_key") or request.form.get("channel_key") or "").strip()
@@ -929,6 +1840,15 @@ def edit_channel_rule():
         conn.close()
 
     if request.method == "POST":
+        # ① 先处理 webhook 绑定（只需要做一次）
+        # —— 保存本通道 webhook 绑定 ——
+        sel = []
+        for k, v in request.form.items():
+            if k.startswith("wh_") and v == "1":
+                sel.append(int(k.split("_",1)[1]))
+        replace_channel_webhooks(device_id, channel_key, sel)
+        
+        # ② 再按天保存多段规则  
         # 解析每天的多段：字段命名 day{d}_start_{i} / day{d}_end_{i}，或 day{d}_allday=1
         for d in range(7):
             if request.form.get(f"day{d}_allday") == "1":
@@ -948,12 +1868,17 @@ def edit_channel_rule():
                         e = e or "00:00"
                         segs.append((s, e))
             replace_channel_rules_for_day(device_id, channel_key, d, segs)
+
         return redirect(url_for("devices") + f"?device_id={device_id}")
 
     # GET：读取现有规则以渲染
     days_rules: List[List[Tuple[str,str]]] = []
     for d in range(7):
         days_rules.append(channel_rules_for_weekday(device_id, channel_key, d))
+
+    # 读取 webhook 列表与本通道绑定
+    whs = webhooks_list(active_only=False)
+    bound = set(channel_webhook_ids(device_id, channel_key))
 
     return render_template_string("""
 <!doctype html>
@@ -1025,6 +1950,19 @@ fieldset{border:1px solid var(--line);border-radius:10px;margin:12px 0}
           </div>
         </fieldset>
       {% endfor %}
+      
+      <fieldset>
+        <legend>推送到哪些 Webhook</legend>
+        <div style="display:flex;flex-wrap:wrap;gap:12px">
+          {% for w in whs %}
+            <label style="display:inline-flex;align-items:center;gap:6px;border:1px solid #e5e7eb;border-radius:8px;padding:6px 8px">
+              <input type="checkbox" name="wh_{{ w['id'] }}" value="1" {% if w['id'] in bound %}checked{% endif %}>
+              <span>{{ w['name'] }}{% if not w['enabled'] %}（禁用）{% endif %}{% if w['is_default'] %}（默认）{% endif %}</span>
+            </label>
+          {% endfor %}
+        </div>
+        <div class="muted" style="margin-top:6px">若本通道未勾选任何 webhook，则退回使用“默认 webhook”。可在“Webhook 管理”页设置默认。</div>
+      </fieldset>
 
       <div class="toolbar">
         <button type="submit" class="btn-primary btn">保存</button>
@@ -1069,6 +2007,8 @@ function toggleAllDay(d){
         device_id=device_id, channel_key=channel_key,
         channel_name=(r["channel_name"] or ""),
         days_rules=days_rules,
+        whs=whs,
+        bound=bound,
         back_url=(url_for("devices") + f"?device_id={device_id}")
     )
 
@@ -1098,10 +2038,31 @@ def history():
         "forwarded": q_fw if q_fw in ("0", "1") else None,
         "from": q_from or None,
         "to": q_to or None,
+        "visible_uid": (None if session.get("is_admin") else int(session.get("uid")))
     }
 
     rows, total = query_messages(filters, size, off)
     pages = max(1, (total + size - 1) // size)
+    
+    # —— CSV 导出（导出“当前页”）——
+    if (request.args.get("export") or "").lower() == "csv":
+        import csv, io
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["id","ts","device_id","channel_key","channel_name",
+                    "type","type_name","box_name","device_name",
+                    "score","image_url","forwarded","forward_reason"])
+        for r in rows:
+            w.writerow([
+                r["id"], r["ts"], r["device_id"], r["channel_key"], r["channel_name"] or "",
+                r["type"], r["type_name"] or "", r["box_name"] or "", r["device_name"] or "",
+                r["score"] or "", r["image_url"] or "", r["forwarded"], r["forward_reason"] or "",
+            ])
+        from flask import make_response
+        resp = make_response(buf.getvalue())
+        resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+        resp.headers["Content-Disposition"] = f'attachment; filename="history_page{page}.csv"'
+        return resp
 
     # 基础参数（不含 page/export），用于生成各种链接
     base_params = {}
@@ -1195,7 +2156,7 @@ form.filter{display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin-bott
   </div>
 
   <form method="post" action="{{ delete_sel_url }}" onsubmit="return confirm('删除所选记录？不可恢复！');">
-    <table class="table">
+    <table class="table cardify">
       <thead><tr>
         <th style="width:28px"><input type="checkbox" id="chk_all" onclick="toggleAll()"></th>
         <th>ID</th><th>时间</th><th>设备</th><th>位置键</th><th>位置名</th>
@@ -1205,17 +2166,23 @@ form.filter{display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin-bott
         {% for r in rows %}
         {% set ok = (r['forwarded']==1) %}
         <tr>
-          <td><input type="checkbox" name="ids" value="{{ r['id'] }}"></td>
-          <td>{{ r['id'] }}</td>
-          <td>{{ r['ts'] }}</td>
-          <td><code>{{ r['device_id'] }}</code></td>
-          <td><code>{{ r['channel_key'] }}</code></td>
-          <td>{{ r['channel_name'] or '' }}</td>
-          <td>{{ r['type_name'] }} ({{ r['type'] }})</td>
-          <td>{{ r['box_name'] or '' }} / {{ r['device_name'] or '' }}</td>
-          <td>{{ r['score'] or '' }}</td>
-          <td>{% if r['image_url'] %}<a href="{{ r['image_url'] }}" target="_blank">查看</a>{% endif %}</td>
-          <td>
+          <td data-label="选"><input type="checkbox" name="ids" value="{{ r['id'] }}"></td>
+          <td data-label="ID">{{ r['id'] }}</td>
+          <td data-label="时间">{{ r['ts'] }}</td>
+          <td data-label="设备"><code>{{ r['device_id'] }}</code></td>
+          <td data-label="位置键"><code>{{ r['channel_key'] }}</code></td>
+          <td data-label="位置名">{{ r['channel_name'] or '' }}</td>
+          <td data-label="算法">{{ r['type_name'] }} ({{ r['type'] }})</td>
+          <td data-label="位置">{{ r['box_name'] or '' }} / {{ r['device_name'] or '' }}</td>
+          <td data-label="score">{{ r['score'] or '' }}</td>
+          <td data-label="图片">
+            {% if r['image_url'] %}
+              <a href="{{ r['image_url'] }}" target="_blank" rel="noopener noreferrer">原图</a>
+              {% set pv = preview_from_url(r['image_url']) %}
+              {% if pv %} · <a href="{{ pv }}" target="_blank" rel="noopener noreferrer">预览</a>{% endif %}
+            {% endif %}
+          </td>
+          <td data-label="状态">
             {% if ok %}
               <span class="badge badge-ok">已转发</span>
             {% else %}
@@ -1265,15 +2232,30 @@ function toggleAll(){
 @APP.post("/history/delete")
 @login_required
 def history_delete_selected():
-    ids = request.form.getlist("ids")
-    ids_int = []
-    for x in ids:
-        try:
-            ids_int.append(int(x))
-        except Exception:
-            pass
-    n = delete_messages_by_ids(ids_int)
-    LOG.info("history: deleted selected %s rows", n)
+    ids = [x for x in request.form.getlist("ids") if x.isdigit()]
+    if not ids:
+        return redirect(url_for("history"))
+    ids = [int(x) for x in ids]
+
+    if session.get("is_admin"):
+        n = delete_messages_by_ids(ids)
+        LOG.info("history: admin deleted %s rows", n)
+        return redirect(url_for("history"))
+
+    # 普通用户：仅允许删除自己可见通道的记录
+    vset = user_visible_pairs(int(session.get("uid")))  # set[(device_id, channel_key)]
+    if not vset:
+        return redirect(url_for("history"))
+
+    qmarks = ",".join("?" for _ in ids)
+    conn = _db()
+    try:
+        rows = conn.execute(f"SELECT id, device_id, channel_key FROM messages WHERE id IN ({qmarks})", ids).fetchall()
+    finally:
+        conn.close()
+    allowed_ids = [int(r["id"]) for r in rows if (r["device_id"], r["channel_key"]) in vset]
+    n = delete_messages_by_ids(allowed_ids)
+    LOG.info("history: user %s deleted %s rows (filtered from %s)", session.get("uid"), n, len(ids))
     return redirect(url_for("history"))
 
 @APP.post("/history/delete_all")
@@ -1287,6 +2269,8 @@ def history_delete_all():
         "from": (request.form.get("from") or "").strip() or None,
         "to": (request.form.get("to") or "").strip() or None,
     }
+    if not session.get("is_admin"):
+        filters["visible_uid"] = int(session.get("uid"))
     n = delete_messages_by_filters(filters)
     LOG.info("history: deleted by filters %s rows", n)
     return redirect(url_for("history"))
@@ -1360,6 +2344,50 @@ def _schedule_daily_cleanup():
                 LOG.error("clean: run error %s", e)
 
     threading.Thread(target=_worker, daemon=True).start()
+
+@APP.get("/view/<day>/<fname>")
+def view_snap(day: str, fname: str):
+    # 简单防注入
+    if (not day.isdigit()) or (len(day) != 8) or ("/" in fname) or (".." in fname):
+        abort(404)
+    # 检查文件存在
+    local = Path(APP.static_folder) / "snaps" / day / fname
+    if not local.exists():
+        abort(404)
+
+    img_src = url_for("static", filename=f"snaps/{day}/{fname}", _external=True)
+
+    html = f"""<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="format-detection" content="telephone=no,email=no">
+<title>预览</title>
+<style data-keep>
+:root{{ --bg:#0b1220; --card:#0f172a; --text:#e5e7eb; --line:#1f2937; }}
+@media (prefers-color-scheme: light){{
+  :root{{ --bg:#f6f8fb; --card:#ffffff; --text:#1f2937; --line:#e5e7eb; }}
+}}
+html,body{{height:100%;margin:0;-webkit-text-size-adjust:100%;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial}}
+.topbar{{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);padding:10px 14px}}
+.topbar a{{color:inherit;text-decoration:none;opacity:.8}}
+.wrap{{height:calc(100% - 52px);display:flex;align-items:center;justify-content:center;padding:10px}}
+.pic{{max-width:100%;max-height:100%;object-fit:contain;transition:transform .15s ease;touch-action:manipulation;}}
+.zoom .pic{{max-width:none;max-height:none;transform:scale(1.1)}}
+.tip{{opacity:.7;font-size:12px;text-align:center;padding:6px 0}}
+</style>
+<div class="topbar"><a href="{img_src}" target="_blank">查看原图</a></div>
+<div id="wrap" class="wrap">
+  <img id="pic" class="pic" src="{img_src}" alt="snap">
+</div>
+<div class="tip">轻触切换放大/缩小；原图在右上角</div>
+<script>
+  var zoom=false, wrap=document.getElementById('wrap');
+  wrap.addEventListener('click', function() {{
+    zoom=!zoom; document.body.classList.toggle('zoom', zoom);
+  }});
+</script>
+"""
+    return render_template_string(html)
 
 # ---------------- MQTT (optional) ----------------
 def _run_mqtt_if_configured():

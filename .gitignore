@@ -1,4 +1,4 @@
-./static/
-./.env
-./alarm2ding.db
-./__pycache__/
+__pycache__/ding_webhook.cpython-313.pyc
+static/snaps/*
+.env
+alarm2ding.db
