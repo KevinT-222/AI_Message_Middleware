@@ -1045,10 +1045,9 @@ def _build_md(payload: Dict[str, Any], img_url: Optional[str]) -> Tuple[str, str
     lines = []
     if img_url:
         pv = _preview_url_for_img(img_url)
-        # 行内小图（钉钉里会自适应），下面追加两个链接
         lines.append(f"![snap]({img_url})\n")
-        if pv:
-            lines.append(f"[手机预览（适配微信）]({pv})  ·  [原图]({img_url})\n")
+        # if pv:
+        #     lines.append(f"[手机预览（适配微信）]({pv})  ·  [原图]({img_url})\n")
 
     lines += [
         f"- **时间**：`{st}`",
