@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-app_alarm2ding.py  (history + channel gating + cleanup + deletes)
-------------------------------------------------------------------
+app_alarm2ding.py  (history + channel gating + cleanup + deletes + reconcile)
+-----------------------------------------------------------------------------
 - 接收 AI 盒子告警 -> 去重 -> 本地落图 -> （按设备&通道开关 + 定时）转发钉钉
-- 历史：/login -> /history 查询、筛选、导出 CSV、批量删除、按筛选条件删除全部
-- 设备：/devices 展示“通道列表”，逐条启/停；/devices/edit 配置周一~周日 + 时间段
-- 存储：SQLite（./alarm2ding.db）
-- 出图：固定直链 http://<公网IP>:<port>/static/snaps/YYYYMMDD/<hash>.jpg
-- 清理：每天定时清理旧日目录与容量兜底（可配置；0=不清理）
+- 历史：/login -> /history 查询、筛选、导出 CSV、批量删除、按筛选条件删除全部（含“删记录尽量删图”）
+- 设备：/devices 展示“通道列表”，逐条启/停；/devices/edit 配置周一~周日 + 多时间段 + webhook 绑定
+- 存储：SQLite（./alarm2ding.db）+（可选）WAL/BusyTimeout 提升并发稳定性
+- 出图：固定直链 http://<公网IP>:<port>/static/snaps/YYYYMMDD/<hash>.jpg （若未配置 IMAGE_PUBLIC_BASE，则仍保存相对 URL）
+- 清理：每天定时清理旧日目录与容量兜底；并做“DB↔图片对账修复”（删坏记录 / 删孤儿图）
 - 安全：可选 AUTH_TOKEN（/ai/message 鉴权）
 
 依赖：
@@ -17,11 +17,11 @@ app_alarm2ding.py  (history + channel gating + cleanup + deletes)
 """
 
 from __future__ import annotations
-import os, time, json, base64, hashlib, argparse, logging, sqlite3, shutil
+import os, time, json, base64, hashlib, argparse, logging, sqlite3, shutil, re
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple, List
-from markupsafe import Markup
+from markupsafe import Markup, escape
 from urllib.parse import urlparse
 
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -29,7 +29,7 @@ from functools import lru_cache
 
 from flask import (
     Flask, request, jsonify, redirect, url_for, session,
-    render_template_string, make_response, abort, g
+    render_template_string, make_response, abort
 )
 from ding_webhook import DingRobot, DingRobotError
 
@@ -50,11 +50,14 @@ logging.basicConfig(
 LOG = logging.getLogger("alarm2ding")
 
 APP = Flask(__name__, static_folder="static", static_url_path="/static")
-APP.secret_key = os.getenv("SECRET_KEY", "please_change_me")
+APP.secret_key = os.getenv("SECRET_KEY", "ABCDEFGHIJKLMN")
+
+# ---------------- URL helpers ----------------
+_SNAPS_RE = re.compile(r"/snaps/(\d{8})/([^/?#]+)$")
 
 def _preview_url_for_img(img_url: str) -> Optional[str]:
-    """把 http(s)://.../snaps/<day>/<file>.jpg 转成 /view/<day>/<file> 的预览页链接"""
-    if not img_url: 
+    """把 http(s)://.../snaps/<day>/<file>.jpg 或 /static/snaps/... 转成 /view/<day>/<file> 的预览页链接"""
+    if not img_url:
         return None
     try:
         p = urlparse(img_url)
@@ -72,9 +75,25 @@ def _preview_url_for_img(img_url: str) -> Optional[str]:
 # 让模板里也能直接用 preview_from_url(...)
 APP.jinja_env.globals["preview_from_url"] = _preview_url_for_img
 
-# ---------------- Unified UI Theme & Header ----------------
-import re
+def _topbar(brand: str, nav: List[Dict[str, Any]]) -> Markup:
+    """
+    nav: [{"label": "...", "href": "...", "active": bool}, ...]
+    """
+    out = []
+    out.append('<div class="topbar"><div class="topbar-inner">')
+    out.append(f'<div class="brand"><span class="dot"></span><span>{escape(brand)}</span></div>')
+    out.append('<div class="nav">')
+    for it in (nav or []):
+        label = escape(str(it.get("label", "")))
+        href  = escape(str(it.get("href", "#")))
+        cls   = "active" if it.get("active") else ""
+        out.append(f'<a href="{href}" class="{cls}">{label}</a>')
+    out.append('</div></div></div>')
+    return Markup("".join(out))
 
+APP.jinja_env.globals["topbar"] = _topbar
+
+# ---------------- Unified UI Theme & Header ----------------
 THEME_CSS = r"""
 :root{
   --bg:#f6f8fb; --card:#ffffff; --text:#1f2937; --muted:#6b7280; --line:#e5e7eb;
@@ -106,7 +125,7 @@ img{max-width:100%;height:auto;display:block}
 
 /* 顶栏 */
 .topbar{position:sticky;top:0;z-index:50;background:var(--bg);border-bottom:1px solid var(--line)}
-.topbar-inner{max-width:1180px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;padding:12px 16px}
+.topbar-inner{max-width:1180px;margin:0 auto;min-height:var(--topbar-h);display:flex;align-items:center;justify-content:space-between;padding:12px 16px}
 .brand{display:flex;align-items:center;gap:10px;font-weight:700}
 .brand .dot{width:10px;height:10px;border-radius:50%;background:var(--primary)}
 .nav{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
@@ -138,7 +157,7 @@ h1,h2,h3{margin:8px 0 14px}
 .muted{color:var(--muted)}
 .small{font-size:12px}
 
-/* 🔥 栅格：自动响应（表单容器统一用 .form-grid 或页面里 class="filter"） */
+/* 栅格：自动响应（表单容器统一用 .form-grid 或页面里 class="filter"） */
 .form-grid,
 form.filter{
   display:grid;
@@ -149,7 +168,7 @@ form.filter{
 
 /* 表格：桌面为常规表格，小屏自动横向滚动；表头吸顶 */
 .table{width:100%;border-collapse:separate;border-spacing:0}
-.table thead th{position:sticky;top:56px;background:var(--card);z-index:1}
+.table thead th{position:sticky;top:var(--topbar-h);background:var(--card);z-index:1}
 .table th,.table td{border-bottom:1px solid var(--line);padding:10px 12px;text-align:left;vertical-align:top}
 
 /* 小屏优化 */
@@ -158,12 +177,9 @@ form.filter{
   .container{padding:10px}
   .nav{gap:8px}
   .btn{padding:8px 10px}
-  /* 表格在小屏滚动显示 */
   .table{display:block;overflow:auto;-webkit-overflow-scrolling:touch}
-  /* 让工具条换行 */
   .toolbar, .ops{flex-wrap:wrap}
 }
-/* 小屏把表格渲染为“卡片列表” */
 @media (max-width: 860px){
   .table.cardify{border:0;display:block;overflow:visible}
   .table.cardify thead{display:none}
@@ -176,7 +192,6 @@ form.filter{
   }
   .table.cardify td > *{max-width:58%;word-break:break-all;text-align:right}
 }
-
 """
 
 # 可选：把各页面内联的“基础样式”去掉，避免和主题冲突（用 env 控制）
@@ -184,20 +199,16 @@ STRIP_PAGE_BASE_CSS = os.getenv("STRIP_PAGE_BASE_CSS", "1") == "1"
 _BASE_SELECTORS = (":root", "body{", ".container", ".card", ".btn", ".table")
 
 def _inject_viewport_meta(html: str) -> str:
-    """若页面缺少 <meta name="viewport"> 则自动补上。优先塞到 </head> 前；没有 <head> 就塞到文首。"""
     if re.search(r'<meta\s+name=["\']viewport["\']', html, flags=re.I):
         return html
     tag = '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">\n'
     if re.search(r"</head>", html, flags=re.I):
         return re.sub(r"</head>", tag + "</head>", html, count=1, flags=re.I)
-    # 没有 head：尽量放到 <title> 前；再不行就塞到最前面
     if re.search(r"<title[^>]*>", html, flags=re.I):
         return re.sub(r"(<title[^>]*>)", tag + r"\1", html, count=1, flags=re.I)
     return tag + html
 
-
 def _strip_conflicting_css(html: str) -> str:
-    """删除没有 data-keep 的 <style> 基础样式块，保留组件/局部样式；需要时可关闭此功能。"""
     if not STRIP_PAGE_BASE_CSS:
         return html
 
@@ -206,24 +217,18 @@ def _strip_conflicting_css(html: str) -> str:
         css   = m.group(2) or ""
         if "data-keep" in attrs:
             return m.group(0)
-        # 命中基础选择器的才移除；否则保留
         if any(sel in css for sel in _BASE_SELECTORS):
-            return ""  # 丢弃冲突的基础样式块
+            return ""
         return m.group(0)
 
     return re.sub(r"<style([^>]*)>(.*?)</style>", _repl, html, flags=re.I | re.S)
 
 def _inject_theme_css(html: str) -> str:
-    """无论模板是否有 <head>，都注入主题；优先插到 </head> 前，否则追加到文末（保证覆盖）。"""
     if 'id="app-theme"' in html:
         return html
     block = f'\n<style id="app-theme">{THEME_CSS}</style>\n'
-
-    # 尽量在 </head> 前注入（大小写不敏感）
     if re.search(r"</head>", html, flags=re.I):
         return re.sub(r"</head>", block + "</head>", html, count=1, flags=re.I)
-
-    # 没有 <head>：尝试在 </body> 前注入；再不行就直接拼接到文末
     if re.search(r"</body>", html, flags=re.I):
         return re.sub(r"</body>", block + "</body>", html, count=1, flags=re.I)
     return html + block
@@ -235,7 +240,6 @@ def _after_inject_theme(resp):
         if "text/html" in ct and not resp.direct_passthrough:
             body = resp.get_data(as_text=True)
             body = _inject_viewport_meta(body)
-            # ↓↓↓ 加这一行：预览页不要剥样式
             if not (request and request.path.startswith("/view/")):
                 body = _strip_conflicting_css(body)
             body = _inject_theme_css(body)
@@ -244,7 +248,7 @@ def _after_inject_theme(resp):
         LOG.debug("theme inject fail: %s", e)
     return resp
 
-
+# ---------------- Runtime Config ----------------
 APP_NAME     = os.getenv("APP_NAME", "algo-edge")
 DEDUP_WINDOW = float(os.getenv("DEDUP_WINDOW", "10"))
 
@@ -273,8 +277,11 @@ VISIBLE_AT = os.getenv("VISIBLE_AT", "0") == "1"
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin")
 
-# 默认转发：设备、通道首次出现时的默认开关
-FORWARD_DEFAULT = 1 if os.getenv("FORWARD_DEFAULT", "1") == "1" else 0
+# 默认开关（首次出现时）
+# - 设备：默认允许
+# - 通道：默认不转发
+DEVICE_FORWARD_DEFAULT  = 1 if os.getenv("DEVICE_FORWARD_DEFAULT", "1") == "1" else 0
+CHANNEL_FORWARD_DEFAULT = 1 if os.getenv("CHANNEL_FORWARD_DEFAULT", "0") == "1" else 0
 
 # 可选鉴权
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
@@ -284,21 +291,26 @@ MQTT_BROKER_HOST = os.getenv("MQTT_BROKER_HOST", "").strip()
 MQTT_BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "1883"))
 MQTT_TOPIC       = os.getenv("MQTT_TOPIC", "xinhuoaie-event/#")
 
-# 自动清理
+# 自动清理（图片）
 SNAP_RETAIN_DAYS = int(os.getenv("SNAP_RETAIN_DAYS", "30"))  # 0=不按天清理
 SNAP_MAX_GB      = float(os.getenv("SNAP_MAX_GB", "0"))      # 0=不设容量上限
 CLEAN_AT         = os.getenv("CLEAN_AT", "03:10")            # 每日 HH:MM
 
 # ---- DB 轮巡清理（防止 alarm2ding.db 无限增大）----
-# 说明：
-# - DB_RETAIN_DAYS：按时间保留最近 N 天 messages（0=不按天清理）
-# - DB_MAX_ROWS：最多保留 N 条 messages（0=不限制）
-# - DB_SWEEP_SEC：在持续写入时的“轮巡间隔秒”，避免单日爆量撑满磁盘（0=禁用轮巡）
-# - DB_VACUUM：每日定时清理后是否尝试 VACUUM（用于真正回收磁盘；会占用额外临时空间）
-DB_RETAIN_DAYS = int(os.getenv("DB_RETAIN_DAYS", str(SNAP_RETAIN_DAYS)))  # 默认跟随 snaps：30天
+DB_RETAIN_DAYS = int(os.getenv("DB_RETAIN_DAYS", str(SNAP_RETAIN_DAYS)))  # 默认跟随 snaps
 DB_MAX_ROWS    = int(os.getenv("DB_MAX_ROWS", "0"))
 DB_SWEEP_SEC   = int(os.getenv("DB_SWEEP_SEC", "60"))
 DB_VACUUM      = os.getenv("DB_VACUUM", "1") == "1"
+
+# ---- 对账修复：DB↔图片一致性 ----
+RECONCILE_DAILY = os.getenv("RECONCILE_DAILY", "1") == "1"
+BROKEN_REF_POLICY = os.getenv("BROKEN_REF_POLICY", "delete_record")  # delete_record | clear_url
+ORPHAN_FILE_POLICY = os.getenv("ORPHAN_FILE_POLICY", "delete_file")  # delete_file | keep
+RECONCILE_MAX_URLS = int(os.getenv("RECONCILE_MAX_URLS", "200000"))   # 0=不限制（谨慎）
+
+# SQLite 稳定性（WAL + busy_timeout）
+SQLITE_WAL = os.getenv("SQLITE_WAL", "1") == "1"
+SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "5000"))
 
 # 运行目录 & 数据库
 DATA_DIR = Path(".").resolve()
@@ -319,10 +331,7 @@ ALGO_MAP = {
 }
 
 # ---------------- Utils ----------------
-
-# _recent_keys 做定期清理
 def _prune_recent_keys(now: float, ttl: float):
-    # 最多每 200 次调用清一次；或当字典过大时清
     if not hasattr(_prune_recent_keys, "_cnt"):
         _prune_recent_keys._cnt = 0
     _prune_recent_keys._cnt += 1
@@ -331,90 +340,6 @@ def _prune_recent_keys(now: float, ttl: float):
     dead = [k for k, t in list(_recent_keys.items()) if now - t > max(ttl*2, 30)]
     for k in dead:
         _recent_keys.pop(k, None)
-
-def _db_file_size_bytes() -> int:
-    try:
-        return DB_PATH.stat().st_size
-    except Exception:
-        return 0
-
-def _db_rotate_once(vacuum: bool=False) -> int:
-    """
-    轮巡删除 messages：按天/按最大条数清理，避免 DB 无限增长。
-    vacuum=True 时在删除后尝试 VACUUM（真正回收磁盘空间）。
-    返回删除行数。
-    """
-    if DB_RETAIN_DAYS <= 0 and DB_MAX_ROWS <= 0:
-        return 0
-
-    deleted = 0
-    conn = _db()
-    try:
-        # 1) 按天保留
-        if DB_RETAIN_DAYS > 0:
-            cutoff = (datetime.now() - timedelta(days=DB_RETAIN_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
-            cur = conn.execute("DELETE FROM messages WHERE ts < ?", (cutoff,))
-            deleted += (cur.rowcount or 0)
-
-        # 2) 最大条数保留（再兜一层，防止单日爆量）
-        if DB_MAX_ROWS > 0:
-            r = conn.execute("SELECT COUNT(1) AS c FROM messages").fetchone()
-            total = int(r["c"]) if r else 0
-            over = total - int(DB_MAX_ROWS)
-            if over > 0:
-                cur = conn.execute(
-                    "DELETE FROM messages WHERE id IN ("
-                    "  SELECT id FROM messages ORDER BY ts ASC, id ASC LIMIT ?"
-                    ")",
-                    (over,)
-                )
-                deleted += (cur.rowcount or 0)
-
-        conn.commit()
-    except sqlite3.OperationalError as e:
-        # 避免与写入竞争导致大量 “database is locked”
-        LOG.warning("dbclean: skip (%s)", e)
-        return 0
-    finally:
-        conn.close()
-
-    # 3) 真正回收磁盘（可选）
-    if vacuum and DB_VACUUM and deleted > 0:
-        try:
-            # VACUUM 会生成临时文件，低磁盘时直接跳过避免雪上加霜
-            sz = _db_file_size_bytes()
-            if sz > 0:
-                free = shutil.disk_usage(str(DB_PATH.parent)).free
-                need = int(sz * 1.2)  # 粗略预留
-                if free < need:
-                    LOG.warning("dbclean: skip VACUUM (free=%s < need~%s)", free, need)
-                else:
-                    c2 = _db()
-                    try:
-                        c2.execute("VACUUM")
-                        c2.commit()
-                    finally:
-                        c2.close()
-        except Exception as e:
-            LOG.warning("dbclean: VACUUM fail: %s", e)
-
-    if deleted > 0:
-        LOG.info("dbclean: deleted=%s (retain_days=%s max_rows=%s vacuum=%s)",
-                 deleted, DB_RETAIN_DAYS, DB_MAX_ROWS, int(vacuum and DB_VACUUM))
-    return deleted
-
-def _db_sweep_maybe(now: float):
-    """写入高峰期的轻量轮巡：最多每 DB_SWEEP_SEC 秒执行一次（不 VACUUM）。"""
-    global _db_sweep_last
-    if DB_SWEEP_SEC <= 0:
-        return
-    # 轮巡主要用于“条数兜底”；纯按天清理走每日定时即可
-    if DB_MAX_ROWS <= 0:
-        return
-    if (now - _db_sweep_last) < DB_SWEEP_SEC:
-        return
-    _db_sweep_last = now
-    _db_rotate_once(vacuum=False)
 
 def _safe_str(d: Dict[str, Any], key: str, default: str = "") -> str:
     v = d.get(key, default)
@@ -442,6 +367,13 @@ def _parse_time(s: str) -> str:
         pass
     return s
 
+def _event_day(payload: Dict[str, Any]) -> str:
+    """图片目录 day：优先用 signTime 对齐历史记录；避免 now() 导致错位"""
+    st = _parse_time(_safe_str(payload, "signTime"))
+    if len(st) >= 10 and st[4] == "-" and st[7] == "-":
+        return st[:10].replace("-", "")
+    return datetime.now().strftime("%Y%m%d")
+
 def _dedup_key(payload: Dict[str, Any]) -> str:
     dev   = _safe_str(payload, "deviceId") or _safe_str(payload, "GBID") or _safe_str(payload, "indexCode")
     t     = _safe_int(payload, "type", -1)
@@ -459,10 +391,6 @@ def _algo_name(type_id: Optional[int], type_name: str) -> str:
     return f"未知({type_id})"
 
 def _pos_key(payload: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
-    """
-    计算“位置键”：优先 indexCode，其次 GBID，否则 deviceName
-    返回 (device_id, channel_key, channel_name, box_name, index_or_gbid)
-    """
     device_id   = _safe_str(payload, "deviceId") or "-"
     device_name = _safe_str(payload, "deviceName")
     box_name    = _safe_str(payload, "boxName")
@@ -472,39 +400,94 @@ def _pos_key(payload: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
     channel_name= device_name or idx or gbid or "-"
     return device_id, channel_key, channel_name, box_name, (idx or gbid)
 
-# ---- 时间窗判断（支持跨午夜） ----
 def _in_time_window(now_hhmm: str, start_hhmm: Optional[str], end_hhmm: Optional[str]) -> bool:
     if not start_hhmm or not end_hhmm:
-        return True  # 未配置时间窗 = 不限制
+        return True
     try:
         nh = int(now_hhmm[:2]); nm = int(now_hhmm[3:5]); n = nh*60 + nm
         sh = int(start_hhmm[:2]); sm = int(start_hhmm[3:5]); s = sh*60 + sm
         eh = int(end_hhmm[:2]);   em = int(end_hhmm[3:5]);   e = eh*60 + em
         if s == e:
-            return True  # 起止相同，视为全天
+            return True
         if s < e:
             return s <= n < e
         else:
-            # 跨午夜：22:00-06:00
             return n >= s or n < e
     except Exception:
         return True
 
-def _bitmask_from_days(days: List[int]) -> int:
-    # days: 0=周一 ... 6=周日
-    m = 0
-    for d in days:
-        if 0 <= d <= 6:
-            m |= (1 << d)
-    return m
+# ---- snaps <-> url/path helpers ----
+def _snap_rel_from_url(img_url: str) -> Optional[str]:
+    """从 image_url 提取 'snaps/YYYYMMDD/xxx.jpg' 相对路径"""
+    if not img_url:
+        return None
+    try:
+        p = urlparse(img_url)
+        m = _SNAPS_RE.search(p.path)
+        if not m:
+            return None
+        day, fname = m.group(1), m.group(2)
+        return f"snaps/{day}/{fname}"
+    except Exception:
+        return None
 
-def _day_enabled(mask: int, weekday0_mon: int) -> bool:
-    # weekday0_mon: Monday=0 ... Sunday=6
-    if mask <= 0:
-        return True  # 未配置掩码 = 不限制
-    return (mask & (1 << weekday0_mon)) != 0
+def _snap_local_path_from_rel(rel: str) -> Path:
+    return Path(APP.static_folder) / rel
 
-# ---- 图片处理（base64 -> 本地落盘 -> 固定直链） ----
+def _db_count_refs_for_rel(rel: str) -> int:
+    pat = "%" + "/" + rel.replace("\\", "/")
+    conn = _db()
+    try:
+        r = conn.execute("SELECT COUNT(1) AS c FROM messages WHERE image_url LIKE ?", (pat,)).fetchone()
+        return int(r["c"]) if r else 0
+    finally:
+        conn.close()
+
+def _delete_db_rows_by_rel(rel: str) -> int:
+    if not rel:
+        return 0
+    pat = "%" + "/" + rel.replace("\\", "/")
+    conn = _db()
+    try:
+        cur = conn.execute("DELETE FROM messages WHERE image_url LIKE ?", (pat,))
+        conn.commit()
+        return cur.rowcount or 0
+    finally:
+        conn.close()
+
+def _delete_snap_if_orphan(rel: str):
+    """当 DB 不再引用该图片时，删除本地文件（以及空目录）"""
+    if not rel:
+        return
+    try:
+        if _db_count_refs_for_rel(rel) > 0:
+            return
+        p = _snap_local_path_from_rel(rel)
+        if p.exists():
+            p.unlink()
+        parent = p.parent
+        if parent.exists() and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+    except Exception as e:
+        LOG.warning("snap rm fail: %s (%s)", rel, e)
+
+def _fetch_rels_by_ids(ids: List[int]) -> List[str]:
+    if not ids:
+        return []
+    qmarks = ",".join("?" for _ in ids)
+    conn = _db()
+    try:
+        rows = conn.execute(f"SELECT image_url FROM messages WHERE id IN ({qmarks})", ids).fetchall()
+        rels = []
+        for r in rows:
+            rel = _snap_rel_from_url(r["image_url"] or "")
+            if rel:
+                rels.append(rel)
+        return rels
+    finally:
+        conn.close()
+
+# ---- 图片处理（base64 -> 本地落盘 -> URL） ----
 def _save_base64_then_public(payload: Dict[str, Any]) -> Optional[str]:
     b64_fields = ["signBigAvatarBase64", "signBigAvatar", "signAvatar"]
     b64 = None
@@ -516,24 +499,29 @@ def _save_base64_then_public(payload: Dict[str, Any]) -> Optional[str]:
         LOG.info("b64: no base64 field -> skip")
         return None
     try:
-        # 去掉 data URI 前缀（如果有）
         if "," in b64 and b64.strip().lower().startswith("data:"):
             b64 = b64.split(",", 1)[1]
-        blob = base64.b64decode(b64, validate=True)
-        day  = datetime.now().strftime("%Y%m%d")
+        b64 = re.sub(r"\s+", "", b64)  # 去换行空格
+        b64 += "=" * ((4 - len(b64) % 4) % 4)  # 补齐 padding
+        blob = base64.b64decode(b64, validate=False)
+
+        day  = _event_day(payload)  # ★ 用 signTime 对齐目录
         out_dir = Path(APP.static_folder) / "snaps" / day
         out_dir.mkdir(parents=True, exist_ok=True)
+
         h = hashlib.md5(blob).hexdigest()[:16]
         out_path = out_dir / f"{h}.jpg"
+
         if not out_path.exists():
             out_path.write_bytes(blob)
             LOG.info("b64: saved (%s) -> %s", which, out_path)
+
+        # ★ 最稳：IMAGE_PUBLIC_BASE 不设也给一个相对 URL，保证 DB↔文件可对账
         if IMAGE_PUBLIC_BASE:
             url = f"{IMAGE_PUBLIC_BASE}/snaps/{day}/{h}.jpg"
-            LOG.info("b64: public url -> %s", url)
-            return url
-        LOG.info("b64: IMAGE_PUBLIC_BASE not set -> no public url")
-        return None
+        else:
+            url = f"/static/snaps/{day}/{h}.jpg"
+        return url
     except Exception as e:
         LOG.warning("b64: decode fail: %s", e)
         return None
@@ -641,10 +629,17 @@ CREATE TABLE IF NOT EXISTS channel_webhooks (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_dedup ON messages(dedup_key);
 """
 
-
 def _db():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        if SQLITE_WAL:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
     return conn
 
 def init_db():
@@ -657,12 +652,10 @@ def init_db():
 def ensure_migrations():
     conn = _db()
     try:
-        # 补列：messages.forward_reason
         try:
             conn.execute("ALTER TABLE messages ADD COLUMN forward_reason TEXT")
         except Exception:
             pass
-        # 创建新增表（若已存在不会报错）
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -697,8 +690,6 @@ def ensure_migrations():
         conn.commit()
     finally:
         conn.close()
-
-    # 引导：若无任何用户，则创建默认管理员
     _bootstrap_admin_if_absent()
 
 def upsert_device(device_id: str, seen_ts: str) -> int:
@@ -713,17 +704,14 @@ def upsert_device(device_id: str, seen_ts: str) -> int:
             return enabled
         else:
             conn.execute("INSERT INTO devices(device_id, enabled, first_seen, last_seen, cnt) VALUES(?,?,?,?,?)",
-                         (device_id, FORWARD_DEFAULT, seen_ts, seen_ts, 1))
+                         (device_id, DEVICE_FORWARD_DEFAULT, seen_ts, seen_ts, 1))
             conn.commit()
-            return FORWARD_DEFAULT
+            return DEVICE_FORWARD_DEFAULT
     finally:
         conn.close()
 
 def upsert_channel(device_id: str, channel_key: str, channel_name: str,
                    box_name: str, index_or_gbid: str, seen_ts: str) -> Tuple[int, int, Optional[str], Optional[str]]:
-    """
-    返回 (enabled, rule_mask, rule_start, rule_end)
-    """
     conn = _db()
     try:
         row = conn.execute(
@@ -743,9 +731,9 @@ def upsert_channel(device_id: str, channel_key: str, channel_name: str,
                              enabled, first_seen, last_seen, cnt, rule_mask, rule_start, rule_end)
                              VALUES(?,?,?,?,?,?,?, ?, ?, 0, NULL, NULL)""",
                          (device_id, channel_key, channel_name, box_name, index_or_gbid,
-                          FORWARD_DEFAULT, seen_ts, seen_ts, 1))
+                          CHANNEL_FORWARD_DEFAULT, seen_ts, seen_ts, 1))
             conn.commit()
-            return FORWARD_DEFAULT, 0, None, None
+            return CHANNEL_FORWARD_DEFAULT, 0, None, None
     finally:
         conn.close()
 
@@ -754,16 +742,6 @@ def set_channel_enabled(device_id: str, channel_key: str, enabled: int):
     try:
         conn.execute("UPDATE channels SET enabled=? WHERE device_id=? AND channel_key=?",
                      (1 if enabled else 0, device_id, channel_key))
-        conn.commit()
-    finally:
-        conn.close()
-
-def update_channel_rule(device_id: str, channel_key: str, mask: int,
-                        start_hhmm: Optional[str], end_hhmm: Optional[str]):
-    conn = _db()
-    try:
-        conn.execute("UPDATE channels SET rule_mask=?, rule_start=?, rule_end=? WHERE device_id=? AND channel_key=?",
-                     (int(mask), start_hhmm, end_hhmm, device_id, channel_key))
         conn.commit()
     finally:
         conn.close()
@@ -803,7 +781,6 @@ def query_messages(filters: Dict[str, Any], limit: int, offset: int) -> Tuple[Li
     if filters.get("from"):      wh.append("ts >= ?"); args.append(filters["from"])
     if filters.get("to"):        wh.append("ts <= ?"); args.append(filters["to"])
 
-    # 权限限制（普通用户）
     if filters.get("visible_uid") is not None:
         wh.append("""EXISTS (
             SELECT 1 FROM user_channels uc
@@ -845,7 +822,6 @@ def delete_messages_by_filters(filters: Dict[str, Any]) -> int:
     if filters.get("forwarded") in ("0","1"): wh.append("forwarded = ?"); args.append(int(filters["forwarded"]))
     if filters.get("from"): wh.append("ts >= ?"); args.append(filters["from"])
     if filters.get("to"):   wh.append("ts <= ?"); args.append(filters["to"])
-    # ☆ 新增：可见性限制（普通用户）
     if filters.get("visible_uid") is not None:
         wh.append("""EXISTS (
             SELECT 1 FROM user_channels uc
@@ -921,13 +897,6 @@ def summarize_rules_short(device_id: str, channel_key: str) -> str:
     return " ".join(parts)
 
 def migrate_legacy_channel_rules_once():
-    """
-    把 channels 表里旧版 rule_mask/rule_start/rule_end 迁移到 channel_rules（只迁一次）。
-    规则：
-      - 若 rule_mask>0：对掩码为1的星期插入一条段
-      - 若 start/end 为空：用 '00:00' ~ '00:00' 表示“全天”
-      - 迁移后把 rule_mask 清零、start/end 置空，避免重复迁移
-    """
     conn = _db()
     try:
         rows = conn.execute(
@@ -937,26 +906,23 @@ def migrate_legacy_channel_rules_once():
         for r in rows:
             dev, ck = r["device_id"], r["channel_key"]
             if channel_has_any_rules(dev, ck):
-                # 已有新版规则，跳过
                 continue
             mask = int(r["rule_mask"] or 0)
             s = r["rule_start"] or "00:00"
             e = r["rule_end"] or "00:00"
             if mask == 0:
-                # 旧版没设掩码，但给了时间段：视为“所有天同一段”
                 for d in range(7):
                     replace_channel_rules_for_day(dev, ck, d, [(s,e)])
             else:
-                for d in range(7):  # Monday=0..Sunday=6
+                for d in range(7):
                     if (mask & (1<<d)) != 0:
                         replace_channel_rules_for_day(dev, ck, d, [(s,e)])
-            # 清空旧字段，避免重复迁移
             conn.execute("UPDATE channels SET rule_mask=0, rule_start=NULL, rule_end=NULL "
                          "WHERE device_id=? AND channel_key=?", (dev, ck))
         conn.commit()
     finally:
         conn.close()
-        
+
 def _now_str(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def _bootstrap_admin_if_absent():
@@ -1013,7 +979,6 @@ def user_delete(uid: int):
         conn.close()
 
 def user_visible_pairs(uid: int) -> set[tuple[str,str]]:
-    """返回 (device_id, channel_key) 集合。管理员返回空集代表不限制。"""
     u = user_by_id(uid)
     if not u: return set()
     if int(u["is_admin"]) == 1: return set()
@@ -1046,14 +1011,22 @@ def webhooks_list(active_only=True):
 def webhook_add(name: str, token: str, secret: str, enabled: int, is_default: int):
     conn = _db()
     try:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO webhooks(name,access_token,secret,enabled,is_default,created_at) VALUES(?,?,?,?,?,?)",
-            (name, token, secret, int(enabled), int(is_default), _now_str())
+            (name, token, secret, int(enabled), 0, _now_str())  # 先插入，默认先置 0
         )
         conn.commit()
+        wid = int(cur.lastrowid or 0)
     finally:
         conn.close()
 
+    if wid > 0:
+        if int(is_default) == 1:
+            webhook_set_default(wid)
+        else:
+            # 如果还没有默认，但新增的是 enabled=1，则自动补一个默认
+            if int(enabled) == 1 and webhook_get_default_enabled_id() is None:
+                webhook_set_default(wid)
 
 def webhook_update_enable(wid: int, enabled: int, is_default: Optional[int]=None):
     conn = _db()
@@ -1100,6 +1073,46 @@ def replace_channel_webhooks(device_id: str, channel_key: str, webhook_ids: list
     finally:
         conn.close()
 
+def webhook_get_default_enabled_id() -> Optional[int]:
+    conn = _db()
+    try:
+        r = conn.execute(
+            "SELECT id FROM webhooks WHERE enabled=1 AND is_default=1 ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+        return int(r["id"]) if r else None
+    finally:
+        conn.close()
+
+def webhook_set_default(wid: int):
+    """设置唯一默认（并强制 enabled=1）"""
+    conn = _db()
+    try:
+        conn.execute("UPDATE webhooks SET is_default=0")
+        conn.execute("UPDATE webhooks SET is_default=1, enabled=1 WHERE id=?", (int(wid),))
+        conn.commit()
+    finally:
+        conn.close()
+
+def webhook_ensure_some_default():
+    """如果存在 enabled=1 的 webhook 但没有默认，则挑一个最小 id 当默认"""
+    conn = _db()
+    try:
+        r = conn.execute(
+            "SELECT 1 FROM webhooks WHERE enabled=1 AND is_default=1 LIMIT 1"
+        ).fetchone()
+        if r:
+            return
+        r2 = conn.execute(
+            "SELECT id FROM webhooks WHERE enabled=1 ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+        if r2:
+            conn.execute("UPDATE webhooks SET is_default=0")
+            conn.execute("UPDATE webhooks SET is_default=1 WHERE id=?", (int(r2["id"]),))
+            conn.commit()
+    finally:
+        conn.close()
+
+
 @lru_cache(maxsize=128)
 def _robot_cached(wid: int):
     conn = _db()
@@ -1111,7 +1124,170 @@ def _robot_cached(wid: int):
     finally:
         conn.close()
 
+# ---------------- DB sweep & vacuum helpers ----------------
+def _db_file_size_bytes() -> int:
+    try:
+        return DB_PATH.stat().st_size
+    except Exception:
+        return 0
 
+def _vacuum_db_safely() -> bool:
+    """VACUUM 会占用额外临时空间，低磁盘时跳过。"""
+    try:
+        sz = _db_file_size_bytes()
+        if sz <= 0:
+            return True
+        free = shutil.disk_usage(str(DB_PATH.parent)).free
+        need = int(sz * 1.2)
+        if free < need:
+            LOG.warning("vacuum: skip (free=%s < need~%s)", free, need)
+            return False
+        c = _db()
+        try:
+            c.execute("VACUUM")
+            c.commit()
+        finally:
+            c.close()
+        return True
+    except Exception as e:
+        LOG.warning("vacuum: fail: %s", e)
+        return False
+
+def _db_rotate_once(vacuum: bool=False) -> int:
+    if DB_RETAIN_DAYS <= 0 and DB_MAX_ROWS <= 0:
+        return 0
+
+    deleted = 0
+    conn = _db()
+    try:
+        if DB_RETAIN_DAYS > 0:
+            cutoff = (datetime.now() - timedelta(days=DB_RETAIN_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+            cur = conn.execute("DELETE FROM messages WHERE ts < ?", (cutoff,))
+            deleted += (cur.rowcount or 0)
+
+        if DB_MAX_ROWS > 0:
+            r = conn.execute("SELECT COUNT(1) AS c FROM messages").fetchone()
+            total = int(r["c"]) if r else 0
+            over = total - int(DB_MAX_ROWS)
+            if over > 0:
+                cur = conn.execute(
+                    "DELETE FROM messages WHERE id IN ("
+                    "  SELECT id FROM messages ORDER BY ts ASC, id ASC LIMIT ?"
+                    ")",
+                    (over,)
+                )
+                deleted += (cur.rowcount or 0)
+
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        LOG.warning("dbclean: skip (%s)", e)
+        return 0
+    finally:
+        conn.close()
+
+    if vacuum and DB_VACUUM and deleted > 0:
+        _vacuum_db_safely()
+
+    if deleted > 0:
+        LOG.info("dbclean: deleted=%s (retain_days=%s max_rows=%s vacuum=%s)",
+                 deleted, DB_RETAIN_DAYS, DB_MAX_ROWS, int(vacuum and DB_VACUUM))
+    return deleted
+
+def _db_sweep_maybe(now: float):
+    global _db_sweep_last
+    if DB_SWEEP_SEC <= 0:
+        return
+    if DB_MAX_ROWS <= 0:
+        return
+    if (now - _db_sweep_last) < DB_SWEEP_SEC:
+        return
+    _db_sweep_last = now
+    _db_rotate_once(vacuum=False)
+
+# ---------------- Reconcile: DB <-> snaps ----------------
+def reconcile_db_and_snaps() -> Dict[str, int]:
+    """
+    最稳策略：
+      - DB 引用但文件不存在：默认删记录（BROKEN_REF_POLICY=delete_record）
+      - 文件存在但 DB 不引用：默认删文件（ORPHAN_FILE_POLICY=delete_file）
+    """
+    root = Path(APP.static_folder) / "snaps"
+    root.mkdir(parents=True, exist_ok=True)
+
+    referenced: set[str] = set()
+    scanned_urls = 0
+
+    truncated = False
+    conn = _db()
+    try:
+        cur = conn.execute("SELECT id, image_url FROM messages WHERE image_url IS NOT NULL AND image_url<>''")
+        for r in cur:
+            scanned_urls += 1
+            if RECONCILE_MAX_URLS > 0 and scanned_urls > RECONCILE_MAX_URLS:
+                LOG.warning("reconcile: stop (scanned_urls>%s)", RECONCILE_MAX_URLS)
+                truncated = True
+                break
+            rel = _snap_rel_from_url(r["image_url"] or "")
+            if rel:
+                referenced.add(rel)
+    finally:
+        conn.close()
+
+    # 1) broken refs
+    broken = 0
+    fixed_rows = 0
+    for rel in list(referenced):
+        if not _snap_local_path_from_rel(rel).exists():
+            broken += 1
+            if BROKEN_REF_POLICY == "clear_url":
+                pat = "%" + "/" + rel
+                c2 = _db()
+                try:
+                    cur = c2.execute("UPDATE messages SET image_url=NULL WHERE image_url LIKE ?", (pat,))
+                    c2.commit()
+                    fixed_rows += (cur.rowcount or 0)
+                finally:
+                    c2.close()
+            else:
+                fixed_rows += _delete_db_rows_by_rel(rel)
+            referenced.discard(rel)
+
+    # 2) orphan files
+    orphan = 0
+    deleted_files = 0
+    if ORPHAN_FILE_POLICY == "delete_file" and (not truncated):
+        for p in root.rglob("*.jpg"):
+            try:
+                rel = f"snaps/{p.parent.name}/{p.name}"
+                if rel not in referenced:
+                    orphan += 1
+                    p.unlink(missing_ok=True)
+                    deleted_files += 1
+            except Exception:
+                pass
+    elif truncated:
+        LOG.warning("reconcile: truncated scan -> skip orphan deletion to avoid false deletes")
+
+    # 3) remove empty dirs
+    removed_dirs = 0
+    for d in sorted(root.glob("*")):
+        try:
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+                removed_dirs += 1
+        except Exception:
+            pass
+
+    stats = {
+        "scanned_urls": scanned_urls,
+        "broken_refs": broken,
+        "fixed_rows": fixed_rows,
+        "orphan_files": orphan,
+        "deleted_files": deleted_files,
+        "removed_dirs": removed_dirs,
+    }
+    LOG.info("reconcile: %s", stats)
+    return stats
 
 # ---------------- Markdown 构造 ----------------
 def _build_md(payload: Dict[str, Any], img_url: Optional[str]) -> Tuple[str, str]:
@@ -1123,119 +1299,78 @@ def _build_md(payload: Dict[str, Any], img_url: Optional[str]) -> Tuple[str, str
     box  = _safe_str(payload, "boxName")
     box_id = _safe_str(payload, "boxId")
     cam  = _safe_str(payload, "deviceName")
-    gbid = _safe_str(payload, "GBID")
-    idx  = _safe_str(payload, "indexCode")
-    rtsp = _safe_str(payload, "rtspUrl")
-    dev  = _safe_str(payload, "deviceId")
     score = _safe_str(payload, "score")
-    xywh = (_safe_str(payload, "x"), _safe_str(payload, "y"),
-            _safe_str(payload, "w"), _safe_str(payload, "h"))
-    track = payload.get("trackId")
-    count = payload.get("count")
-    gender = payload.get("gender")
-    age    = payload.get("age")
-    mask   = payload.get("mask")
-    enter_name = payload.get("enterName")
-    enter_code = payload.get("enterCode")
 
     lines = []
     if img_url:
-        pv = _preview_url_for_img(img_url)
         lines.append(f"![snap]({img_url})\n")
-        # if pv:
-        #     lines.append(f"[手机预览（适配微信）]({pv})  ·  [原图]({img_url})\n")
 
     lines += [
         f"- **时间**：`{st}`",
         f"- **算法**：`{_algo_name(type_id, type_name)}`",
         f"- **设备**：`{cam or '-'} / {box or '-'}(boxId={box_id or '-'})`",
-        # f"- **标识**：`deviceId={dev or '-'} GBID={gbid or '-'} indexCode={idx or '-'}`",
     ]
-    # if enter_name or enter_code:
-    #     lines.append(f"- **企业**：`{enter_name or '-'} / {enter_code or '-'}`")
-    # if track is not None: lines.append(f"- **trackId**：`{track}`")
-    # if score: lines.append(f"- **score**：`{score}`")
-    # if any(xywh): lines.append(f"- **bbox**：`x={xywh[0]} y={xywh[1]} w={xywh[2]} h={xywh[3]}`")
-    # if rtsp and not HIDE_RTSP:
-    #     lines.append(f"- **rtsp**：`{rtsp}`")
 
     attr_bits = []
-    if age is not None:    attr_bits.append(f"age={age}")
-    if gender is not None: attr_bits.append(f"gender={gender}")
-    if mask is not None:   attr_bits.append(f"mask={mask}")
-    if count is not None:  attr_bits.append(f"count={count}")
+    for k in ("age", "gender", "mask", "count"):
+        if payload.get(k) is not None:
+            attr_bits.append(f"{k}={payload.get(k)}")
     if attr_bits:
         lines.append(f"- **attr**：`{' , '.join(attr_bits)}`")
 
     if VISIBLE_AT and (AT_MOBILES or AT_USER_IDS):
-        at_show = [("@" + m) for m in AT_MOBILES] + [("@" + u) for u in AT_USER_IDS]
-        # lines.append(f"- **通知**：{' '.join(at_show)}")
+        pass
 
     return title, "\n".join(lines)
 
 # ---------------- Core Handle ----------------
 def _handle_record_and_forward(payload: Dict[str, Any], echo: bool=False) -> Dict[str, Any]:
-
-    # 去重
     dkey = _dedup_key(payload)
     now  = time.time()
     last = _recent_keys.get(dkey)
     if last and (now - last) < DEDUP_WINDOW:
         return {"code": 200, "message": "重复告警抑制"}
     _recent_keys[dkey] = now
-    
-    # 定期清理
     _prune_recent_keys(now, DEDUP_WINDOW)
 
     st         = _parse_time(_safe_str(payload, "signTime"))
-    device_id  = _safe_str(payload, "deviceId") or "-"
     type_id    = _safe_int(payload, "type", None)
     type_name  = _safe_str(payload, "typeName")
     box_name   = _safe_str(payload, "boxName")
     device_name= _safe_str(payload, "deviceName")
     score      = _safe_str(payload, "score")
 
-    # 位置键 & 通道入库
     dev_id, ch_key, ch_name, box_nm, idx_or_gbid = _pos_key(payload)
     dev_enabled = upsert_device(dev_id, st)
     ch_enabled, rule_mask, rule_start, rule_end = upsert_channel(
         dev_id, ch_key, ch_name, box_nm, idx_or_gbid, st
     )
 
-    # 规则评估（服务器本地时间）
     now_dt   = datetime.now()
-    now_dow  = now_dt.weekday()  # Monday=0..Sunday=6
+    now_dow  = now_dt.weekday()
     now_hm   = now_dt.strftime("%H:%M")
 
-    # 若该通道配置了“多段规则”，则以多段规则为准：
-    #   - 有任何一天设置了任意段 => 视为启用“按日多段”
-    #   - 当天若无任何段 => 当天不转发
-    # 若完全没有任何段 => 视为“不限时间”（仅按设备/通道开关）
     has_rules = channel_has_any_rules(dev_id, ch_key)
     if has_rules:
         segs = channel_rules_for_weekday(dev_id, ch_key, now_dow)
         in_time_multi = any(_in_time_window(now_hm, s, e) for (s,e) in segs) if segs else False
         time_ok = in_time_multi
     else:
-        # 回落到“无时间限制”
         time_ok = True
 
     forward_ok = (dev_enabled == 1) and (ch_enabled == 1) and time_ok
 
-    # 落图 -> URL
     img_url = _resolve_image_url(payload)
 
-    # 组装并（如启用）转发钉钉
     forwarded = False
     forward_reason = ""
     title, text_md = _build_md(payload, img_url)
 
     if not echo and forward_ok:
-        # 计算推送目标：优先通道绑定，其次默认 webhook
         target_ids = channel_webhook_ids(dev_id, ch_key)
         if not target_ids:
-            target_ids = [r["id"] for r in webhooks_list(active_only=True) if int(r["is_default"]) == 1]
-
+            did = webhook_get_default_enabled_id()
+            target_ids = [did] if did else []
 
         succ = 0; total = 0; errs = []
         for wid in (target_ids or []):
@@ -1271,7 +1406,6 @@ def _handle_record_and_forward(payload: Dict[str, Any], echo: bool=False) -> Dic
             if not time_ok:      reasons.append("非时间段")
             forward_reason = "未转发（" + ("，".join(reasons) or "未知原因") + "）"
 
-    # 写入历史
     rec = {
         "ts": st,
         "device_id": dev_id,
@@ -1293,7 +1427,6 @@ def _handle_record_and_forward(payload: Dict[str, Any], echo: bool=False) -> Dic
     except Exception as e:
         LOG.error("db insert fail: %s", e)
 
-    # DB 轮巡（最小改动：写入后触发；节流避免频繁扫库）
     _db_sweep_maybe(time.time())
 
     if echo:
@@ -1308,7 +1441,6 @@ def healthz():
 
 @APP.post("/ai/message")
 def ai_message():
-    # 可选鉴权：?token= 或 Header: X-Auth-Token
     if AUTH_TOKEN:
         t = request.args.get("token") or request.headers.get("X-Auth-Token", "")
         if t != AUTH_TOKEN:
@@ -1362,14 +1494,7 @@ def login():
 <title>登录 - Alarm2Ding</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 
-<div class="topbar">
-  <div class="topbar-inner">
-    <div class="brand"><span class="dot"></span><span>Alarm2Ding</span></div>
-    <div class="nav">
-      <a href="#" class="active">登录</a>
-    </div>
-  </div>
-</div>
+{{ topbar('Alarm2Ding', nav) }}
 
 <div class="container" style="max-width:460px">
   <div class="card">
@@ -1384,34 +1509,103 @@ def login():
     </form>
   </div>
 </div>
-""", err=err)
-
+""", err=err, nav=[])
 
 @APP.get("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login"))
 
+# ---------- Maintenance (admin) ----------
+@APP.get("/maintenance")
+@admin_required
+def maintenance_page():
+    last = session.get("maintenance_last") or {}
+    nav = [
+      {"label":"维护", "href":url_for("maintenance_page"), "active":True},
+      {"label":"Webhook", "href":url_for("webhooks_page")},
+      {"label":"用户", "href":url_for("users_page")},
+      {"label":"通道", "href":url_for("devices")},
+      {"label":"历史记录", "href":url_for("history")},
+      {"label":"退出", "href":url_for("logout")},
+    ]
+    return render_template_string("""
+<!doctype html>
+<title>维护 - Alarm2Ding</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+
+{{ topbar('维护', nav) }}
+
+<div class="container">
+  <div class="card">
+    <h3 style="margin:0 0 10px">一键操作</h3>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <form method="post" action="{{ url_for('maintenance_reconcile') }}">
+        <button class="btn btn-primary">对账修复（DB↔图片）</button>
+      </form>
+      <form method="post" action="{{ url_for('maintenance_clean') }}" onsubmit="return confirm('立即执行清理？');">
+        <button class="btn">立即清理（图片 + DB轮巡）</button>
+      </form>
+      <form method="post" action="{{ url_for('maintenance_vacuum') }}" onsubmit="return confirm('VACUUM 可能耗时且占用临时空间，确定？');">
+        <button class="btn">立即 VACUUM</button>
+      </form>
+    </div>
+    <div class="muted small" style="margin-top:10px">
+      最稳策略：图片缺失→删记录；记录缺失→删孤儿图。每日定时也会执行（可用 env 控制）。
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <h3 style="margin:0 0 10px">最近一次结果</h3>
+    <pre style="white-space:pre-wrap;margin:0">{{ last | tojson(indent=2) }}</pre>
+  </div>
+</div>
+""", last=last, nav=nav)
+
+@APP.post("/maintenance/reconcile")
+@admin_required
+def maintenance_reconcile():
+    stats = reconcile_db_and_snaps()
+    session["maintenance_last"] = {"op":"reconcile", "at":_now_str(), "stats":stats}
+    return redirect(url_for("maintenance_page"))
+
+@APP.post("/maintenance/clean")
+@admin_required
+def maintenance_clean():
+    _clean_old_snaps_once()
+    _db_rotate_once(vacuum=True)
+    stats = reconcile_db_and_snaps()
+    session["maintenance_last"] = {"op":"clean+db+reconcile", "at":_now_str(), "stats":stats}
+    return redirect(url_for("maintenance_page"))
+
+@APP.post("/maintenance/vacuum")
+@admin_required
+def maintenance_vacuum():
+    ok = _vacuum_db_safely()
+    session["maintenance_last"] = {"op":"vacuum", "at":_now_str(), "ok":ok, "db_size":_db_file_size_bytes()}
+    return redirect(url_for("maintenance_page"))
+
 # ---------- User pages ----------
 @APP.get("/users")
 @admin_required
 def users_page():
     rows = user_list()
+    nav = [
+      {"label":"用户", "href":url_for("users_page"), "active":True},
+      {"label":"维护", "href":url_for("maintenance_page")},
+      {"label":"Webhook", "href":url_for("webhooks_page")},
+      {"label":"通道", "href":url_for("devices")},
+      {"label":"历史记录", "href":url_for("history")},
+      {"label":"退出", "href":url_for("logout")},
+    ]
     return render_template_string("""
 <!doctype html>
 <title>用户管理 - Alarm2Ding</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 
+{{ topbar('用户管理', nav) }}
+
 <div class="container">
-  <div class="topbar-inner">
-    <div class="brand"><span class="dot"></span><span>用户管理</span></div>
-    <div class="nav">
-      <a href="{{ url_for('webhooks_page') }}">Webhook</a>
-      <a href="{{ url_for('devices') }}">通道管理</a>
-      <a href="{{ url_for('history') }}">历史记录</a>
-      <a href="{{ url_for('logout') }}">退出</a>
-    </div>
-  </div>
 
   <div class="card" style="margin-top:12px">
     <h3 style="margin:0 0 10px">新增用户</h3>
@@ -1479,10 +1673,9 @@ def users_page():
 </div>
 
 <style>
-/* 仅页面局部样式，避免触发基础样式剥离 */
 .ops{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 </style>
-""", rows=rows)
+""", rows=rows, nav=nav)
 
 @APP.post("/users/add")
 @admin_required
@@ -1516,31 +1709,31 @@ def users_perm():
         pairs = []
         for k, v in request.form.items():
             if k.startswith("ck_") and v == "1":
-                # 名称格式：ck___<device_id>___<channel_key>
                 _, dev, ck = k.split("___", 2)
                 pairs.append((dev, ck))
         replace_user_visible_pairs(uid, pairs)
         return redirect(url_for("users_page"))
 
-    rows = list_channels("")  # 全量通道
+    rows = list_channels("")
     vis = user_visible_pairs(uid)
 
+    nav = [
+      {"label":"用户", "href":url_for("users_page"), "active":True},
+      {"label":"维护", "href":url_for("maintenance_page")},
+      {"label":"Webhook", "href":url_for("webhooks_page")},
+      {"label":"通道", "href":url_for("devices")},
+      {"label":"历史记录", "href":url_for("history")},
+      {"label":"退出", "href":url_for("logout")},
+    ]
+    
     return render_template_string("""
 <!doctype html>
 <title>配置可见通道 - Alarm2Ding</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 
+{{ topbar('配置可见通道', nav) }}
+
 <div class="container">
-  <div class="topbar-inner">
-    <div class="brand"><span class="dot"></span><span>配置可见通道</span></div>
-    <div class="nav">
-      <a class="active" href="{{ url_for('users_page') }}">用户管理</a>
-      <a href="{{ url_for('webhooks_page') }}">Webhook</a>
-      <a href="{{ url_for('devices') }}">通道管理</a>
-      <a href="{{ url_for('history') }}">历史记录</a>
-      <a href="{{ url_for('logout') }}">退出</a>
-    </div>
-  </div>
 
   <div class="card" style="margin-top:12px">
     <h3 style="margin:0 0 8px">用户：{{ u['username'] }}</h3>
@@ -1639,7 +1832,7 @@ $('#kw').addEventListener('input', e => {
 });
 updateStat();
 </script>
-""", u=u, rows=rows, vis=vis)
+""", u=u, rows=rows, vis=vis, nav=nav)
 
 # ---------- webhooks settings pages ----------
 @APP.route("/webhooks", methods=["GET","POST"])
@@ -1656,21 +1849,24 @@ def webhooks_page():
         return redirect(url_for("webhooks_page"))
 
     rows = webhooks_list(active_only=False)
+    
+    nav = [
+      {"label":"Webhook", "href":url_for("webhooks_page"), "active":True},
+      {"label":"维护", "href":url_for("maintenance_page")},
+      {"label":"用户", "href":url_for("users_page")},
+      {"label":"通道", "href":url_for("devices")},
+      {"label":"历史记录", "href":url_for("history")},
+      {"label":"退出", "href":url_for("logout")},
+    ]
+    
     return render_template_string("""
 <!doctype html>
 <title>Webhook 管理 - Alarm2Ding</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 
+{{ topbar('Webhook 管理', nav) }}
+
 <div class="container">
-  <div class="topbar-inner">
-    <div class="brand"><span class="dot"></span><span>Webhook 管理</span></div>
-    <div class="nav">
-      <a href="{{ url_for('users_page') }}">用户管理</a>
-      <a href="{{ url_for('devices') }}">通道管理</a>
-      <a href="{{ url_for('history') }}">历史记录</a>
-      <a href="{{ url_for('logout') }}">退出</a>
-    </div>
-  </div>
 
   <div class="card" style="margin-top:12px">
     <h3 style="margin:0 0 10px">新增 Webhook</h3>
@@ -1747,18 +1943,30 @@ def webhooks_page():
 </div>
 
 <style>
-/* 仅页面局部样式，避免触发基础样式剥离 */
 .ops{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 </style>
-""", rows=rows)
-
+""", rows=rows, nav=nav)
 
 @APP.post("/webhooks/toggle")
 @admin_required
 def webhooks_toggle():
     wid = int(request.form.get("wid"))
     enabled = int(request.form.get("enabled"))
-    webhook_update_enable(wid, enabled)
+
+    conn = _db()
+    try:
+        # 如果要禁用当前默认，则先清掉默认标记
+        if enabled == 0:
+            conn.execute("UPDATE webhooks SET enabled=0, is_default=0 WHERE id=?", (wid,))
+        else:
+            conn.execute("UPDATE webhooks SET enabled=1 WHERE id=?", (wid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    if enabled == 0:
+        webhook_ensure_some_default()
+
     _robot_cached.cache_clear()
     return redirect(url_for("webhooks_page"))
 
@@ -1766,9 +1974,19 @@ def webhooks_toggle():
 @admin_required
 def webhooks_toggle_default():
     wid = int(request.form.get("wid"))
-    is_def = int(request.form.get("is_default"))  # 0/1
-    # 设为默认时顺便确保启用，避免默认但禁用导致“默认不可用”
-    webhook_update_enable(wid, enabled=1, is_default=is_def)
+    is_def = int(request.form.get("is_default"))  # 1=设为默认，0=取消默认
+
+    if is_def == 1:
+        webhook_set_default(wid)
+    else:
+        conn = _db()
+        try:
+            conn.execute("UPDATE webhooks SET is_default=0 WHERE id=?", (wid,))
+            conn.commit()
+        finally:
+            conn.close()
+        webhook_ensure_some_default()
+
     _robot_cached.cache_clear()
     return redirect(url_for("webhooks_page"))
 
@@ -1784,7 +2002,6 @@ def webhooks_del():
 @APP.route("/devices", methods=["GET","POST"])
 @login_required
 def devices():
-    # 切换通道开关
     if request.method == "POST":
         if not session.get("is_admin"):
             abort(403)
@@ -1799,14 +2016,11 @@ def devices():
 
     device_filter = (request.args.get("device_id") or "").strip()
     rows = list_channels(device_filter=device_filter)
-    
-    # 权限过滤：普通用户仅看自己授权的通道
-    vset = set()
+
     if not session.get("is_admin"):
         vset = user_visible_pairs(int(session.get("uid")))
         rows = [r for r in rows if (r["device_id"], r["channel_key"]) in vset]
 
-    # 计算规则摘要
     rows2 = []
     for r in rows:
         rule_label = summarize_rules_short(r["device_id"], r["channel_key"])
@@ -1814,66 +2028,26 @@ def devices():
         d["rule_label"] = rule_label
         rows2.append(d)
 
+    nav = [{"label":"通道", "href":url_for("devices"), "active":True},
+       {"label":"历史记录", "href":url_for("history")},
+       {"label":"退出", "href":url_for("logout")}]
+    if session.get("is_admin"):
+      nav.insert(1, {"label":"维护", "href":url_for("maintenance_page")})
+      nav.insert(2, {"label":"用户", "href":url_for("users_page")})
+      nav.insert(3, {"label":"Webhook", "href":url_for("webhooks_page")})
+
     return render_template_string("""
 <!doctype html>
 <title>通道管理 - Alarm2Ding</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-:root{
-  --bg:#f6f8fb; --card:#fff; --text:#222; --muted:#666; --primary:#2563eb;
-  --ok:#16a34a; --err:#dc2626; --line:#e5e7eb;
-}
-body{background:var(--bg);font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial;margin:0;padding:0;color:var(--text)}
-.container{max-width:1180px;margin:3vh auto;padding:16px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:0 1px 2px rgba(0,0,0,.04);padding:18px}
-h2{margin:8px 0 14px}
-.topbar{display:flex;justify-content:space-between;align-items:center}
-a{color:var(--primary);text-decoration:none}
-a:hover{text-decoration:underline}
-.inp{padding:8px;border:1px solid var(--line);border-radius:8px}
-.btn{
-  display:inline-flex;
-  align-items:center;
-  gap:6px;
-  padding:6px 10px;
-  border:1px solid var(--line);
-  background:#fff;
-  border-radius:8px;
-  cursor:pointer;
-  white-space:nowrap;
-  word-break:keep-all;
-  text-decoration:none;
-}
-.btn:hover{border-color:#cfd4dc}
-.badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px}
-.badge-ok{background:#e8f7ee;color:#065f46}
-.badge-err{background:#fde8e8;color:#7f1d1d}
-.table{width:100%;border-collapse:collapse}
-.table th,.table td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
-.table thead th{background:#fafbfd;font-weight:600}
-.ops{
-  display:flex;
-  gap:8px;
-  align-items:center;
-  flex-wrap:wrap;
-}
-.ops form{display:inline}
-</style>
+
+{{ topbar('通道管理', nav) }}
 
 <div class="container">
-  <div class="topbar">
-    <h2>通道管理</h2>
-    <div>
-        {% if session.get('is_admin') %}
-        <a href="{{ url_for('users_page') }}">用户管理</a> ｜ <a href="{{ url_for('webhooks_page') }}">Webhook</a> ｜ 
-        {% endif %}
-        <a href="{{ url_for('history') }}">历史记录</a> ｜ <a href="{{ url_for('logout') }}">退出</a>
-    </div>
-  </div>
 
-  <div class="card" style="margin-bottom:12px">
-    <form method="get" style="display:flex;gap:8px">
-      <input name="device_id" class="inp" placeholder="按 device_id 过滤" value="{{ request.args.get('device_id','') }}">
+  <div class="card" style="margin-bottom:12px;margin-top:12px">
+    <form method="get" style="display:flex;gap:8px;flex-wrap:wrap">
+      <input name="device_id" class="inp" placeholder="按 device_id 过滤" value="{{ request.args.get('device_id','') }}" style="min-width:220px">
       <button type="submit" class="btn">筛选</button>
     </form>
   </div>
@@ -1902,6 +2076,7 @@ a:hover{text-decoration:underline}
           <td data-label="规则摘要" style="font-size:12px;line-height:1.3">{{ r['rule_label'] }}</td>
           <td data-label="操作">
             <div class="ops">
+              {% if session.get('is_admin') %}
               <form method="post">
                 <input type="hidden" name="device_id" value="{{ r['device_id'] }}">
                 <input type="hidden" name="channel_key" value="{{ r['channel_key'] }}">
@@ -1909,6 +2084,9 @@ a:hover{text-decoration:underline}
                 <button type="submit" class="btn">{{ '禁用转发' if r['enabled'] else '启用转发' }}</button>
               </form>
               <a class="btn" href="{{ url_for('edit_channel_rule') }}?device_id={{ r['device_id'] }}&channel_key={{ r['channel_key'] }}">编辑规则</a>
+              {% else %}
+                <span class="muted small">无权限</span>
+              {% endif %}
             </div>
           </td>
         </tr>
@@ -1917,7 +2095,12 @@ a:hover{text-decoration:underline}
     </table>
   </div>
 </div>
-""", rows=rows2)
+
+<style>
+.ops{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.ops form{display:inline}
+</style>
+""", rows=rows2, nav=nav)
 
 @APP.route("/devices/edit", methods=["GET","POST"])
 @admin_required
@@ -1927,7 +2110,6 @@ def edit_channel_rule():
     if not device_id or not channel_key:
         return redirect(url_for("devices"))
 
-    # 拉取通道
     conn = _db()
     try:
         r = conn.execute("SELECT * FROM channels WHERE device_id=? AND channel_key=?",
@@ -1938,19 +2120,14 @@ def edit_channel_rule():
         conn.close()
 
     if request.method == "POST":
-        # ① 先处理 webhook 绑定（只需要做一次）
-        # —— 保存本通道 webhook 绑定 ——
         sel = []
         for k, v in request.form.items():
             if k.startswith("wh_") and v == "1":
                 sel.append(int(k.split("_",1)[1]))
         replace_channel_webhooks(device_id, channel_key, sel)
-        
-        # ② 再按天保存多段规则  
-        # 解析每天的多段：字段命名 day{d}_start_{i} / day{d}_end_{i}，或 day{d}_allday=1
+
         for d in range(7):
             if request.form.get(f"day{d}_allday") == "1":
-                # 全天：用 s==e 表示全天
                 replace_channel_rules_for_day(device_id, channel_key, d, [("00:00", "00:00")])
                 continue
 
@@ -1969,43 +2146,32 @@ def edit_channel_rule():
 
         return redirect(url_for("devices") + f"?device_id={device_id}")
 
-    # GET：读取现有规则以渲染
     days_rules: List[List[Tuple[str,str]]] = []
     for d in range(7):
         days_rules.append(channel_rules_for_weekday(device_id, channel_key, d))
 
-    # 读取 webhook 列表与本通道绑定
     whs = webhooks_list(active_only=False)
     bound = set(channel_webhook_ids(device_id, channel_key))
 
-    return render_template_string("""
+    nav = [
+      {"label":"通道", "href":url_for("devices", device_id=device_id), "active":True},
+      {"label":"历史记录", "href":url_for("history")},
+      {"label":"退出", "href":url_for("logout")},
+    ]
+    if session.get("is_admin"):
+        nav.insert(1, {"label":"维护", "href":url_for("maintenance_page")})
+        nav.insert(2, {"label":"用户", "href":url_for("users_page")})
+        nav.insert(3, {"label":"Webhook", "href":url_for("webhooks_page")})
+
+
+    return render_template_string(r"""
 <!doctype html>
 <title>编辑规则 - Alarm2Ding</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-:root{
-  --bg:#f6f8fb; --card:#fff; --text:#222; --muted:#666; --primary:#2563eb;
-  --ok:#16a34a; --warn:#d97706; --err:#dc2626; --line:#e5e7eb;
-}
-body{background:var(--bg);font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial;margin:0;padding:0;color:var(--text)}
-.container{max-width:820px;margin:3vh auto;padding:16px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:0 1px 2px rgba(0,0,0,.04);padding:18px}
-h3{margin:8px 0 14px}
-legend{font-weight:600;color:var(--primary)}
-.btn{padding:8px 12px;border:1px solid var(--line);background:#fff;border-radius:8px;cursor:pointer}
-.btn:hover{border-color:#cfd4dc}
-.btn-primary{background:var(--primary);color:#fff;border-color:var(--primary)}
-.btn-danger{color:#fff;background:var(--err);border-color:var(--err)}
-.badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;background:#eef; color:#223}
-fieldset{border:1px solid var(--line);border-radius:10px;margin:12px 0}
-.row{display:flex;gap:8px;align-items:center;margin:6px 0}
-.inp{width:120px;padding:6px 8px;border:1px solid var(--line);border-radius:8px}
-.toolbar{display:flex;gap:10px;margin-top:14px}
-.muted{color:var(--muted)}
-.hide{display:none}
-</style>
 
-<div class="container">
+{{ topbar('编辑规则', nav) }}
+
+<div class="container" style="max-width:820px">
   <div class="card">
     <h3>编辑规则（每天可设多个时间段）</h3>
     <div class="muted" style="margin:-2px 0 12px">
@@ -2018,10 +2184,9 @@ fieldset{border:1px solid var(--line);border-radius:10px;margin:12px 0}
 
       {% set labels = ['周一','周二','周三','周四','周五','周六','周日'] %}
       {% for d in range(7) %}
-        {% set has_seg = (days_rules[d]|length>0) %}
         {% set is_all = (days_rules[d]|length==1) and (days_rules[d][0][0]==days_rules[d][0][1]) %}
-        <fieldset>
-          <legend>{{ labels[d] }}</legend>
+        <fieldset style="border:1px solid var(--line);border-radius:10px;margin:12px 0;padding:12px">
+          <legend style="font-weight:600;color:var(--primary)">{{ labels[d] }}</legend>
 
           <label style="display:inline-flex;align-items:center;gap:8px;margin:4px 0 6px">
             <input type="checkbox" id="day{{d}}_allday" name="day{{d}}_allday" value="1" {% if is_all %}checked{% endif %} onchange="toggleAllDay({{d}})">
@@ -2032,28 +2197,28 @@ fieldset{border:1px solid var(--line);border-radius:10px;margin:12px 0}
             {% for seg in days_rules[d] %}
               {% if not (days_rules[d]|length==1 and seg[0]==seg[1]) %}
                 {% set i = loop.index0 %}
-                <div class="row seg">
-                  <input name="day{{d}}_start_{{ i }}" class="inp" placeholder="HH:MM" value="{{ seg[0] }}">
+                <div class="row seg" style="display:flex;gap:8px;align-items:center;margin:6px 0">
+                  <input name="day{{d}}_start_{{ i }}" class="inp" placeholder="HH:MM" value="{{ seg[0] }}" style="width:120px">
                   <span>~</span>
-                  <input name="day{{d}}_end_{{ i }}" class="inp" placeholder="HH:MM" value="{{ seg[1] }}">
+                  <input name="day{{d}}_end_{{ i }}" class="inp" placeholder="HH:MM" value="{{ seg[1] }}" style="width:120px">
                   <button type="button" class="btn" onclick="this.parentNode.remove()">删除</button>
                 </div>
               {% endif %}
             {% endfor %}
           </div>
 
-          <div style="margin-top:6px;display:flex;gap:8px">
+          <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">
             <button type="button" class="btn" onclick="addRow({{d}})">+ 添加一段</button>
             <button type="button" class="btn" onclick="clearDay({{d}})">清空本日</button>
           </div>
         </fieldset>
       {% endfor %}
-      
-      <fieldset>
-        <legend>推送到哪些 Webhook</legend>
+
+      <fieldset style="border:1px solid var(--line);border-radius:10px;margin:12px 0;padding:12px">
+        <legend style="font-weight:600;color:var(--primary)">推送到哪些 Webhook</legend>
         <div style="display:flex;flex-wrap:wrap;gap:12px">
           {% for w in whs %}
-            <label style="display:inline-flex;align-items:center;gap:6px;border:1px solid #e5e7eb;border-radius:8px;padding:6px 8px">
+            <label style="display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:8px;padding:6px 8px">
               <input type="checkbox" name="wh_{{ w['id'] }}" value="1" {% if w['id'] in bound %}checked{% endif %}>
               <span>{{ w['name'] }}{% if not w['enabled'] %}（禁用）{% endif %}{% if w['is_default'] %}（默认）{% endif %}</span>
             </label>
@@ -2062,13 +2227,17 @@ fieldset{border:1px solid var(--line);border-radius:10px;margin:12px 0}
         <div class="muted" style="margin-top:6px">若本通道未勾选任何 webhook，则退回使用“默认 webhook”。可在“Webhook 管理”页设置默认。</div>
       </fieldset>
 
-      <div class="toolbar">
-        <button type="submit" class="btn-primary btn">保存</button>
+      <div class="toolbar" style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
+        <button type="submit" class="btn btn-primary">保存</button>
         <a class="btn" href="{{ back_url }}">返回</a>
       </div>
     </form>
   </div>
 </div>
+
+<style>
+.hide{display:none}
+</style>
 
 <script>
 function addRow(d){
@@ -2076,10 +2245,10 @@ function addRow(d){
   const allday = document.getElementById('day'+d+'_allday').checked;
   if (allday){ alert('已勾选全天，需先取消“全天”再添加时段'); return; }
   const idx = parseInt(box.dataset.idx || '0');
-  const html = '<div class="row seg">'
-             + '<input name="day'+d+'_start_'+idx+'" class="inp" placeholder="HH:MM" value="">'
+  const html = '<div class="row seg" style="display:flex;gap:8px;align-items:center;margin:6px 0">'
+             + '<input name="day'+d+'_start_'+idx+'" class="inp" placeholder="HH:MM" value="" style="width:120px">'
              + '<span>~</span>'
-             + '<input name="day'+d+'_end_'+idx+'" class="inp" placeholder="HH:MM" value="">'
+             + '<input name="day'+d+'_end_'+idx+'" class="inp" placeholder="HH:MM" value="" style="width:120px">'
              + '<button type="button" class="btn" onclick="this.parentNode.remove()">删除</button>'
              + '</div>';
   box.insertAdjacentHTML('beforeend', html);
@@ -2107,9 +2276,9 @@ function toggleAllDay(d){
         days_rules=days_rules,
         whs=whs,
         bound=bound,
-        back_url=(url_for("devices") + f"?device_id={device_id}")
+        back_url=(url_for("devices") + f"?device_id={device_id}"),
+        nav=nav
     )
-
 
 # ---------- History ----------
 @APP.get("/history")
@@ -2117,7 +2286,6 @@ function toggleAllDay(d){
 def history():
     from urllib.parse import urlencode
 
-    # 读取查询参数
     q_device = (request.args.get("device_id") or "").strip()
     q_channel= (request.args.get("channel_key") or "").strip()
     q_type   = (request.args.get("type") or "").strip()
@@ -2128,7 +2296,6 @@ def history():
     size     = max(1, min(100, int(request.args.get("size") or "20")))
     off      = (page - 1) * size
 
-    # 过滤条件
     filters = {
         "device_id": q_device or None,
         "channel_key": q_channel or None,
@@ -2141,8 +2308,7 @@ def history():
 
     rows, total = query_messages(filters, size, off)
     pages = max(1, (total + size - 1) // size)
-    
-    # —— CSV 导出（导出“当前页”）——
+
     if (request.args.get("export") or "").lower() == "csv":
         import csv, io
         buf = io.StringIO()
@@ -2156,13 +2322,11 @@ def history():
                 r["type"], r["type_name"] or "", r["box_name"] or "", r["device_name"] or "",
                 r["score"] or "", r["image_url"] or "", r["forwarded"], r["forward_reason"] or "",
             ])
-        from flask import make_response
         resp = make_response(buf.getvalue())
         resp.headers["Content-Type"] = "text/csv; charset=utf-8"
         resp.headers["Content-Disposition"] = f'attachment; filename="history_page{page}.csv"'
         return resp
 
-    # 基础参数（不含 page/export），用于生成各种链接
     base_params = {}
     if q_device: base_params["device_id"] = q_device
     if q_channel: base_params["channel_key"] = q_channel
@@ -2184,48 +2348,26 @@ def history():
 
     devices_url = url_for("devices")
     logout_url  = url_for("logout")
+    nav = [
+        {"label":"历史记录", "href":url_for("history"), "active":True},
+        {"label":"通道", "href":url_for("devices")},
+        {"label":"退出", "href":url_for("logout")},
+    ]
+    if session.get("is_admin"):
+        nav.insert(1, {"label":"维护", "href":url_for("maintenance_page")})
+        nav.insert(2, {"label":"用户", "href":url_for("users_page")})
+        nav.insert(3, {"label":"Webhook", "href":url_for("webhooks_page")})
 
     return render_template_string("""
 <!doctype html>
 <title>历史记录 - Alarm2Ding</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-:root{
-  --bg:#f6f8fb; --card:#fff; --text:#222; --muted:#666; --primary:#2563eb;
-  --ok:#16a34a; --warn:#d97706; --err:#dc2626; --line:#e5e7eb;
-}
-body{background:var(--bg);font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial;margin:0;padding:0;color:var(--text)}
-.container{max-width:1180px;margin:3vh auto;padding:16px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:0 1px 2px rgba(0,0,0,.04);padding:18px}
-h2{margin:8px 0 14px}
-.topbar{display:flex;justify-content:space-between;align-items:center}
-a{color:var(--primary);text-decoration:none}
-a:hover{text-decoration:underline}
-form.filter{display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin-bottom:12px}
-.inp{padding:8px;border:1px solid var(--line);border-radius:8px}
-.btn{padding:8px 12px;border:1px solid var(--line);background:#fff;border-radius:8px;cursor:pointer}
-.btn:hover{border-color:#cfd4dc}
-.btn-danger{color:#fff;background:var(--err);border-color:var(--err)}
-.table{width:100%;border-collapse:collapse}
-.table th,.table td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
-.table thead th{background:#fafbfd;font-weight:600}
-.badge{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px}
-.badge-ok{background:#e8f7ee;color:#065f46}
-.badge-err{background:#fde8e8;color:#7f1d1d}
-.badge-warn{background:#fff7ed;color:#7c2d12}
-.muted{color:var(--muted)}
-.pager a{margin-right:6px}
-</style>
+
+{{ topbar('历史记录', nav) }}
 
 <div class="container">
-  <div class="topbar">
-    <h2>历史记录</h2>
-    <div class="muted">
-      <a href="{{ devices_url }}">通道管理</a> ｜ <a href="{{ logout_url }}">退出</a>
-    </div>
-  </div>
 
-  <form method="get" class="filter">
+  <form method="get" class="filter" style="margin-top:12px">
     <input name="device_id" class="inp" value="{{ request.args.get('device_id','') }}" placeholder="device_id">
     <input name="channel_key" class="inp" value="{{ request.args.get('channel_key','') }}" placeholder="channel_key(位置键)">
     <input name="type" class="inp" value="{{ request.args.get('type','') }}" placeholder="type">
@@ -2240,7 +2382,7 @@ form.filter{display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin-bott
     <button type="submit" class="btn">查询</button>
   </form>
 
-  <div style="display:flex;gap:14px;align-items:center;margin-bottom:10px">
+  <div style="display:flex;gap:14px;align-items:center;margin:10px 0;flex-wrap:wrap">
     <a class="btn" href="{{ export_url }}">导出当前页 CSV</a>
     <form method="post" action="{{ delete_all_url }}" onsubmit="return confirm('确定要删除【当前筛选条件匹配的全部记录】吗？不可恢复！');">
       <input type="hidden" name="device_id" value="{{ request.args.get('device_id','') }}">
@@ -2249,7 +2391,7 @@ form.filter{display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin-bott
       <input type="hidden" name="forwarded" value="{{ request.args.get('forwarded','') }}">
       <input type="hidden" name="from" value="{{ request.args.get('from','') }}">
       <input type="hidden" name="to" value="{{ request.args.get('to','') }}">
-      <button type="submit" class="btn-danger">按当前筛选全部删除</button>
+      <button type="submit" class="btn btn-danger">按当前筛选全部删除</button>
     </form>
   </div>
 
@@ -2299,7 +2441,7 @@ form.filter{display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin-bott
       </tbody>
     </table>
     <div style="margin-top:8px">
-      <button type="submit" class="btn-danger">删除所选</button>
+      <button type="submit" class="btn btn-danger">删除所选</button>
     </div>
   </form>
 
@@ -2324,7 +2466,8 @@ function toggleAll(){
         rows=rows, total=total, export_url=export_url, page_links=page_links,
         delete_sel_url=url_for("history_delete_selected"),
         delete_all_url=url_for("history_delete_all"),
-        devices_url=devices_url, logout_url=logout_url
+        devices_url=devices_url, logout_url=logout_url, 
+        nav=nav
     )
 
 @APP.post("/history/delete")
@@ -2336,12 +2479,14 @@ def history_delete_selected():
     ids = [int(x) for x in ids]
 
     if session.get("is_admin"):
+        rels = _fetch_rels_by_ids(ids)
         n = delete_messages_by_ids(ids)
+        for rel in set(rels):
+            _delete_snap_if_orphan(rel)
         LOG.info("history: admin deleted %s rows", n)
         return redirect(url_for("history"))
 
-    # 普通用户：仅允许删除自己可见通道的记录
-    vset = user_visible_pairs(int(session.get("uid")))  # set[(device_id, channel_key)]
+    vset = user_visible_pairs(int(session.get("uid")))
     if not vset:
         return redirect(url_for("history"))
 
@@ -2352,9 +2497,69 @@ def history_delete_selected():
     finally:
         conn.close()
     allowed_ids = [int(r["id"]) for r in rows if (r["device_id"], r["channel_key"]) in vset]
+    rels = _fetch_rels_by_ids(allowed_ids)
     n = delete_messages_by_ids(allowed_ids)
+    for rel in set(rels):
+        _delete_snap_if_orphan(rel)
     LOG.info("history: user %s deleted %s rows (filtered from %s)", session.get("uid"), n, len(ids))
     return redirect(url_for("history"))
+
+def _count_messages_by_filters(filters: Dict[str, Any]) -> int:
+    wh, args = [], []
+    if filters.get("device_id"): wh.append("device_id = ?"); args.append(filters["device_id"])
+    if filters.get("channel_key"): wh.append("channel_key = ?"); args.append(filters["channel_key"])
+    if filters.get("type") is not None and filters["type"] != "": wh.append("type = ?"); args.append(int(filters["type"]))
+    if filters.get("forwarded") in ("0","1"): wh.append("forwarded = ?"); args.append(int(filters["forwarded"]))
+    if filters.get("from"): wh.append("ts >= ?"); args.append(filters["from"])
+    if filters.get("to"):   wh.append("ts <= ?"); args.append(filters["to"])
+    if filters.get("visible_uid") is not None:
+        wh.append("""EXISTS (
+            SELECT 1 FROM user_channels uc
+            WHERE uc.user_id=?
+              AND uc.device_id = messages.device_id
+              AND uc.channel_key = messages.channel_key
+        )""")
+        args.append(int(filters["visible_uid"]))
+    where = ("WHERE " + " AND ".join(wh)) if wh else ""
+    conn = _db()
+    try:
+        r = conn.execute(f"SELECT COUNT(1) AS c FROM messages {where}", args).fetchone()
+        return int(r["c"]) if r else 0
+    finally:
+        conn.close()
+
+def _fetch_rels_by_filters(filters: Dict[str, Any], max_collect: int) -> List[str]:
+    """在删除前抓取将被删除的 image_url（规模过大时不要用）"""
+    wh, args = [], []
+    if filters.get("device_id"): wh.append("device_id = ?"); args.append(filters["device_id"])
+    if filters.get("channel_key"): wh.append("channel_key = ?"); args.append(filters["channel_key"])
+    if filters.get("type") is not None and filters["type"] != "": wh.append("type = ?"); args.append(int(filters["type"]))
+    if filters.get("forwarded") in ("0","1"): wh.append("forwarded = ?"); args.append(int(filters["forwarded"]))
+    if filters.get("from"): wh.append("ts >= ?"); args.append(filters["from"])
+    if filters.get("to"):   wh.append("ts <= ?"); args.append(filters["to"])
+    if filters.get("visible_uid") is not None:
+        wh.append("""EXISTS (
+            SELECT 1 FROM user_channels uc
+            WHERE uc.user_id=?
+              AND uc.device_id = messages.device_id
+              AND uc.channel_key = messages.channel_key
+        )""")
+        args.append(int(filters["visible_uid"]))
+    where = ("WHERE " + " AND ".join(wh)) if wh else ""
+
+    rels: List[str] = []
+    conn = _db()
+    try:
+        cur = conn.execute(f"SELECT image_url FROM messages {where}", args)
+        for r in cur:
+            if max_collect > 0 and len(rels) >= max_collect:
+                break
+            rel = _snap_rel_from_url(r["image_url"] or "")
+            if rel:
+                rels.append(rel)
+    finally:
+        conn.close()
+    return rels
 
 @APP.post("/history/delete_all")
 @login_required
@@ -2369,8 +2574,23 @@ def history_delete_all():
     }
     if not session.get("is_admin"):
         filters["visible_uid"] = int(session.get("uid"))
+
+    # 最稳：小规模时删记录并尽量删图；大规模时删记录后跑 reconcile（避免内存爆）
+    total = _count_messages_by_filters(filters)
+    rels = []
+    if total <= 5000:
+        rels = _fetch_rels_by_filters(filters, max_collect=10000)
+
     n = delete_messages_by_filters(filters)
-    LOG.info("history: deleted by filters %s rows", n)
+    LOG.info("history: deleted by filters %s rows (total=%s)", n, total)
+
+    if rels:
+        for rel in set(rels):
+            _delete_snap_if_orphan(rel)
+    else:
+        # 大规模删除：用对账清理孤儿图、坏记录
+        reconcile_db_and_snaps()
+
     return redirect(url_for("history"))
 
 # ---------------- Cleanup (daily) ----------------
@@ -2382,7 +2602,7 @@ def _clean_old_snaps_once():
     if not root.exists():
         return
 
-    # 1) 按天清理
+    # 1) 按天清理（先删 DB，再删目录）
     if SNAP_RETAIN_DAYS > 0:
         cutoff = (datetime.now() - timedelta(days=SNAP_RETAIN_DAYS)).strftime("%Y%m%d")
         removed_dirs = 0
@@ -2392,13 +2612,23 @@ def _clean_old_snaps_once():
             name = sub.name
             if name.isdigit() and len(name) == 8 and name < cutoff:
                 try:
-                    for p in sub.rglob("*"): p.unlink(missing_ok=True)
-                    sub.rmdir(); removed_dirs += 1
+                    # 先删 DB 引用该天的记录，避免“坏记录”
+                    conn = _db()
+                    try:
+                        cur = conn.execute("DELETE FROM messages WHERE image_url LIKE ?", (f"%/snaps/{name}/%",))
+                        conn.commit()
+                        if (cur.rowcount or 0) > 0:
+                            LOG.info("clean: removed db rows for day %s: %s", name, cur.rowcount)
+                    finally:
+                        conn.close()
+
+                    shutil.rmtree(sub, ignore_errors=True)
+                    removed_dirs += 1
                 except Exception as e:
                     LOG.warning("clean: rm dir %s fail: %s", sub, e)
         LOG.info("clean: removed old day dirs=%s (cutoff=%s)", removed_dirs, cutoff)
 
-    # 2) 容量兜底
+    # 2) 容量兜底（删文件后也删 DB 引用）
     if SNAP_MAX_GB > 0:
         files, total = [], 0
         for p in root.rglob("*.jpg"):
@@ -2411,13 +2641,18 @@ def _clean_old_snaps_once():
                 pass
         limit = int(SNAP_MAX_GB * 1024 * 1024 * 1024)
         if total > limit:
-            files.sort(key=lambda x: x[1])  # 旧->新
+            files.sort(key=lambda x: x[1])
             freed = 0
             for p, _, sz in files:
                 try:
+                    rel = f"snaps/{p.parent.name}/{p.name}"
                     p.unlink(missing_ok=True)
                     freed += sz
-                    if total - freed <= limit: break
+                    _deleted = _delete_db_rows_by_rel(rel)
+                    if _deleted:
+                        LOG.info("clean: removed db rows for %s: %s", rel, _deleted)
+                    if total - freed <= limit:
+                        break
                 except Exception:
                     pass
             LOG.info("clean: total=%s > limit=%s, freed=%s", total, limit, freed)
@@ -2438,8 +2673,9 @@ def _schedule_daily_cleanup():
             _t.sleep(wait)
             try:
                 _clean_old_snaps_once()
-                # DB 每日定时清理（带 VACUUM 尝试回收磁盘）
                 _db_rotate_once(vacuum=True)
+                if RECONCILE_DAILY:
+                    reconcile_db_and_snaps()
             except Exception as e:
                 LOG.error("clean: run error %s", e)
 
@@ -2447,15 +2683,16 @@ def _schedule_daily_cleanup():
 
 @APP.get("/view/<day>/<fname>")
 def view_snap(day: str, fname: str):
-    # 简单防注入
     if (not day.isdigit()) or (len(day) != 8) or ("/" in fname) or (".." in fname):
         abort(404)
-    # 检查文件存在
     local = Path(APP.static_folder) / "snaps" / day / fname
     if not local.exists():
         abort(404)
 
-    img_src = url_for("static", filename=f"snaps/{day}/{fname}", _external=True)
+    if IMAGE_PUBLIC_BASE:
+        img_src = f"{IMAGE_PUBLIC_BASE}/snaps/{day}/{fname}"
+    else:
+        img_src = url_for("static", filename=f"snaps/{day}/{fname}", _external=True)
 
     html = f"""<!doctype html>
 <meta charset="utf-8">
@@ -2524,14 +2761,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=11888)
+    parser.add_argument("--reconcile-now", action="store_true", help="启动后立即对账一次")
+    parser.add_argument("--vacuum-now", action="store_true", help="启动后立即 VACUUM（谨慎）")
     args = parser.parse_args()
 
     Path(APP.static_folder, "snaps").mkdir(parents=True, exist_ok=True)
     init_db()
-    ensure_migrations()                 # ← 为老库补列 forward_reason
-    migrate_legacy_channel_rules_once() # ← 旧掩码规则一次性迁移到多段
+    ensure_migrations()
+    migrate_legacy_channel_rules_once()
     _run_mqtt_if_configured()
     _schedule_daily_cleanup()
+
+    if args.vacuum_now:
+        _vacuum_db_safely()
+    if args.reconcile_now:
+        reconcile_db_and_snaps()
 
     APP.run(host=args.host, port=args.port, threaded=True)
 
