@@ -17,7 +17,7 @@ app_alarm2ding.py  (history + channel gating + cleanup + deletes)
 """
 
 from __future__ import annotations
-import os, time, json, base64, hashlib, argparse, logging, sqlite3
+import os, time, json, base64, hashlib, argparse, logging, sqlite3, shutil
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple, List
@@ -289,11 +289,23 @@ SNAP_RETAIN_DAYS = int(os.getenv("SNAP_RETAIN_DAYS", "30"))  # 0=不按天清理
 SNAP_MAX_GB      = float(os.getenv("SNAP_MAX_GB", "0"))      # 0=不设容量上限
 CLEAN_AT         = os.getenv("CLEAN_AT", "03:10")            # 每日 HH:MM
 
+# ---- DB 轮巡清理（防止 alarm2ding.db 无限增大）----
+# 说明：
+# - DB_RETAIN_DAYS：按时间保留最近 N 天 messages（0=不按天清理）
+# - DB_MAX_ROWS：最多保留 N 条 messages（0=不限制）
+# - DB_SWEEP_SEC：在持续写入时的“轮巡间隔秒”，避免单日爆量撑满磁盘（0=禁用轮巡）
+# - DB_VACUUM：每日定时清理后是否尝试 VACUUM（用于真正回收磁盘；会占用额外临时空间）
+DB_RETAIN_DAYS = int(os.getenv("DB_RETAIN_DAYS", str(SNAP_RETAIN_DAYS)))  # 默认跟随 snaps：30天
+DB_MAX_ROWS    = int(os.getenv("DB_MAX_ROWS", "0"))
+DB_SWEEP_SEC   = int(os.getenv("DB_SWEEP_SEC", "60"))
+DB_VACUUM      = os.getenv("DB_VACUUM", "1") == "1"
+
 # 运行目录 & 数据库
 DATA_DIR = Path(".").resolve()
 DB_PATH  = DATA_DIR / "alarm2ding.db"
 
 _recent_keys: Dict[str, float] = {}
+_db_sweep_last: float = 0.0
 
 # 算法映射（可按需扩充）
 ALGO_MAP = {
@@ -319,6 +331,90 @@ def _prune_recent_keys(now: float, ttl: float):
     dead = [k for k, t in list(_recent_keys.items()) if now - t > max(ttl*2, 30)]
     for k in dead:
         _recent_keys.pop(k, None)
+
+def _db_file_size_bytes() -> int:
+    try:
+        return DB_PATH.stat().st_size
+    except Exception:
+        return 0
+
+def _db_rotate_once(vacuum: bool=False) -> int:
+    """
+    轮巡删除 messages：按天/按最大条数清理，避免 DB 无限增长。
+    vacuum=True 时在删除后尝试 VACUUM（真正回收磁盘空间）。
+    返回删除行数。
+    """
+    if DB_RETAIN_DAYS <= 0 and DB_MAX_ROWS <= 0:
+        return 0
+
+    deleted = 0
+    conn = _db()
+    try:
+        # 1) 按天保留
+        if DB_RETAIN_DAYS > 0:
+            cutoff = (datetime.now() - timedelta(days=DB_RETAIN_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+            cur = conn.execute("DELETE FROM messages WHERE ts < ?", (cutoff,))
+            deleted += (cur.rowcount or 0)
+
+        # 2) 最大条数保留（再兜一层，防止单日爆量）
+        if DB_MAX_ROWS > 0:
+            r = conn.execute("SELECT COUNT(1) AS c FROM messages").fetchone()
+            total = int(r["c"]) if r else 0
+            over = total - int(DB_MAX_ROWS)
+            if over > 0:
+                cur = conn.execute(
+                    "DELETE FROM messages WHERE id IN ("
+                    "  SELECT id FROM messages ORDER BY ts ASC, id ASC LIMIT ?"
+                    ")",
+                    (over,)
+                )
+                deleted += (cur.rowcount or 0)
+
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        # 避免与写入竞争导致大量 “database is locked”
+        LOG.warning("dbclean: skip (%s)", e)
+        return 0
+    finally:
+        conn.close()
+
+    # 3) 真正回收磁盘（可选）
+    if vacuum and DB_VACUUM and deleted > 0:
+        try:
+            # VACUUM 会生成临时文件，低磁盘时直接跳过避免雪上加霜
+            sz = _db_file_size_bytes()
+            if sz > 0:
+                free = shutil.disk_usage(str(DB_PATH.parent)).free
+                need = int(sz * 1.2)  # 粗略预留
+                if free < need:
+                    LOG.warning("dbclean: skip VACUUM (free=%s < need~%s)", free, need)
+                else:
+                    c2 = _db()
+                    try:
+                        c2.execute("VACUUM")
+                        c2.commit()
+                    finally:
+                        c2.close()
+        except Exception as e:
+            LOG.warning("dbclean: VACUUM fail: %s", e)
+
+    if deleted > 0:
+        LOG.info("dbclean: deleted=%s (retain_days=%s max_rows=%s vacuum=%s)",
+                 deleted, DB_RETAIN_DAYS, DB_MAX_ROWS, int(vacuum and DB_VACUUM))
+    return deleted
+
+def _db_sweep_maybe(now: float):
+    """写入高峰期的轻量轮巡：最多每 DB_SWEEP_SEC 秒执行一次（不 VACUUM）。"""
+    global _db_sweep_last
+    if DB_SWEEP_SEC <= 0:
+        return
+    # 轮巡主要用于“条数兜底”；纯按天清理走每日定时即可
+    if DB_MAX_ROWS <= 0:
+        return
+    if (now - _db_sweep_last) < DB_SWEEP_SEC:
+        return
+    _db_sweep_last = now
+    _db_rotate_once(vacuum=False)
 
 def _safe_str(d: Dict[str, Any], key: str, default: str = "") -> str:
     v = d.get(key, default)
@@ -1196,6 +1292,9 @@ def _handle_record_and_forward(payload: Dict[str, Any], echo: bool=False) -> Dic
         insert_message(rec)
     except Exception as e:
         LOG.error("db insert fail: %s", e)
+
+    # DB 轮巡（最小改动：写入后触发；节流避免频繁扫库）
+    _db_sweep_maybe(time.time())
 
     if echo:
         return {"code": 200, "message": "echo", "title": title,
@@ -2339,6 +2438,8 @@ def _schedule_daily_cleanup():
             _t.sleep(wait)
             try:
                 _clean_old_snaps_once()
+                # DB 每日定时清理（带 VACUUM 尝试回收磁盘）
+                _db_rotate_once(vacuum=True)
             except Exception as e:
                 LOG.error("clean: run error %s", e)
 
